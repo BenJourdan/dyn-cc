@@ -3,4 +3,12 @@ name = "dyn-cc"
 version = "0.1.0"
 edition = "2024"
 
+[[bin]]
+name = "dyn-cc"
+path = "src/main.rs"
+
+
 [dependencies]
+indicatif = "0.18.2"
+rand = "0.9.2"
+raphtory = "0.16.3"
