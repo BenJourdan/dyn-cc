@@ -2,6 +2,7 @@
 
 mod tests;
 mod diff;
+mod snapshot_clustering;
 use core::time;
 
 
@@ -14,12 +15,16 @@ use tests::{
     Instruction
 };
 
-use diff::{build_diff};
+use diff::build_snapshot_diffs;
+use snapshot_clustering::{MyClustering};
+
+use crate::snapshot_clustering::SnapshotClusteringAlg;
+
 
 
 fn main(){
-    let num_nodes = 100_000;
-    let num_updates = 1_000_000;
+    let num_nodes = 1_000;
+    let num_updates = 100_000;
     let commands = generate_commands(42424242, num_nodes, num_updates, 0.99, 1.0, 0.5);
 
     let graph = PersistentGraph::new();
@@ -78,15 +83,22 @@ fn main(){
     }
     pb.finish_with_message("processed updates");
 
+    let start = graph.earliest_time().unwrap();
     let end = graph.latest_time().unwrap();
 
 
     println!("{end}");
 
-    let diff = build_diff(&graph, end/2, end, ((end-end/2)/100) as usize, "w");
+    let diffs = build_snapshot_diffs(&graph, start, end, 500, "w").unwrap();
 
-    for (i,bucket) in diff.iter().take(10){
-        println!("{i:?}: {:?}", bucket.iter().take(10).collect::<Vec<_>>());
-    }
+    // for (i,diff) in diffs.iter().take(10){
+    //     println!("{i:?}: {:?}", diff.iter().take(10).collect::<Vec<_>>());
+    // }
+
+    let mut cluster_alg = MyClustering::new();
+
+    cluster_alg.process_diffs_with(&diffs, |time,partition|{
+        println!("processed time: {time}, with a partition of size {}",partition.len());
+    });
 
 }
