@@ -23,8 +23,8 @@ use crate::snapshot_clustering::SnapshotClusteringAlg;
 
 
 fn main(){
-    let num_nodes = 1_000;
-    let num_updates = 100_000;
+    let num_nodes = 10_000;
+    let num_updates = 1_000_000;
     let commands = generate_commands(42424242, num_nodes, num_updates, 0.99, 1.0, 0.5);
 
     let graph = PersistentGraph::new();
@@ -91,9 +91,7 @@ fn main(){
 
     let diffs = build_snapshot_diffs(&graph, start, end, 500, "w").unwrap();
 
-    // for (i,diff) in diffs.iter().take(10){
-    //     println!("{i:?}: {:?}", diff.iter().take(10).collect::<Vec<_>>());
-    // }
+
 
     let mut cluster_alg = MyClustering::new();
 

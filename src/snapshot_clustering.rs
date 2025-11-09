@@ -1,14 +1,29 @@
-use raphtory::core::entities::VID;
+use raphtory::prelude::NodeViewOps;
+use raphtory::{core::entities::VID, prelude::GraphViewOps};
+use raphtory::db::graph::views::deletion_graph::PersistentGraph;
 
 use crate::diff::{EdgeOp, SnapshotDiffs};
 
 use std::{collections::HashMap, hash::Hash, ops::DerefMut};
 
+pub trait GraphLike{
+    type V;
+
+    fn neighbours(&self, node:&Self::V) -> impl Iterator<Item=Self::V>;
+}
+
+impl GraphLike for PersistentGraph{
+    type V = VID;
+    fn neighbours(&self, node:&Self::V) -> impl Iterator<Item=Self::V> {
+        self.node(node).unwrap().neighbours().iter().map(|x|x.node)
+    }
+}
+
 
 /// Trait to be implemented by Clustering Algorithms that want to consume snapshot diffs 
 pub trait SnapshotClusteringAlg {
 
-    type Partition;
+    type PartitionOutput;
 
     /// Called before any ops at this snapshot (optional)
     fn begin_snapshot(&mut self, time: i64) {}
@@ -17,13 +32,13 @@ pub trait SnapshotClusteringAlg {
     fn apply_edge_ops(&mut self, time: i64, ops: &[EdgeOp]);
 
     /// Called after all ops are applied at this snapshot
-    fn extract_partition(&mut self, time: i64) -> Self::Partition;
+    fn extract_partition(&mut self, time: i64) -> Self::PartitionOutput;
 
     /// Convenience: process all diffs and collect partitions per snapshot.
     fn process_diffs_collect(
         &mut self,
         diffs: &SnapshotDiffs,
-    ) -> Vec<(i64, Self::Partition)> {
+    ) -> Vec<(i64, Self::PartitionOutput)> {
         let mut out = Vec::with_capacity(diffs.snapshot_times.len());
         for (t, diff) in diffs.iter() {
             let time = *t;
@@ -41,7 +56,7 @@ pub trait SnapshotClusteringAlg {
         diffs: &SnapshotDiffs,
         mut on_snapshot: F,
     ) where
-        F: FnMut(i64, &Self::Partition),
+        F: FnMut(i64, &Self::PartitionOutput),
     {
         for (t, diff) in diffs.iter() {
             let time = *t;
@@ -54,17 +69,20 @@ pub trait SnapshotClusteringAlg {
 }
 
 
+
+
+
 pub struct MyClustering{
     adj: HashMap<VID,HashMap<VID,f64>>,
     partition: HashMap<VID, usize>
 }
 
 impl SnapshotClusteringAlg for MyClustering{
-    type Partition = HashMap<VID, usize>;
+    type PartitionOutput = HashMap<VID, usize>;
     
     fn apply_edge_ops(&mut self, time: i64, ops: &[EdgeOp]) {
         for op in ops{
-            match *op{
+            match *op{ 
                 EdgeOp::Update(src,dst, w) => {
                     *self.adj
                         .entry(src)
@@ -96,7 +114,7 @@ impl SnapshotClusteringAlg for MyClustering{
         self.partition = self.adj.keys().enumerate().map(|(i,x)| (*x,i)).collect();
     }
     
-    fn extract_partition(&mut self, time: i64) -> Self::Partition {
+    fn extract_partition(&mut self, time: i64) -> Self::PartitionOutput {
         self.partition.clone()
     }
 }

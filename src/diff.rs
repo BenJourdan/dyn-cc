@@ -188,6 +188,7 @@ pub fn build_snapshot_diffs(graph: &PersistentGraph, start:i64, end: i64, step_s
 
 
 
+//MARK: Tests
 
 // ChatGPT built tests. Most important one is at the end
 
