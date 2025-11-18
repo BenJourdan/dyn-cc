@@ -91,12 +91,10 @@ fn main(){
 
     let diffs = build_snapshot_diffs(&graph, start, end, 500, "w").unwrap();
 
-
+    println!("Built {} diffs", diffs.snapshot_diffs.len());
 
     let mut cluster_alg = MyClustering::new();
 
-    cluster_alg.process_diffs_with(&diffs, |time,partition|{
-        println!("processed time: {time}, with a partition of size {}",partition.len());
-    });
+    cluster_alg.process_diffs(&diffs, &graph);
 
 }

@@ -1,69 +1,80 @@
-use raphtory::prelude::NodeViewOps;
+use raphtory::prelude::{Graph, NodeViewOps, TimeOps};
 use raphtory::{core::entities::VID, prelude::GraphViewOps};
 use raphtory::db::graph::views::deletion_graph::PersistentGraph;
 
-use crate::diff::{EdgeOp, SnapshotDiffs};
+use crate::diff::{EdgeOp, SnapshotDiffs, ExtendedEdgeOp};
 
+use std::default;
 use std::{collections::HashMap, hash::Hash, ops::DerefMut};
 
 pub trait GraphLike{
     type V;
 
-    fn neighbours(&self, node:&Self::V) -> impl Iterator<Item=Self::V>;
+    fn neighbours(&self, node:&Self::V, time: i64) -> impl Iterator<Item=Self::V>;
 }
 
 impl GraphLike for PersistentGraph{
     type V = VID;
-    fn neighbours(&self, node:&Self::V) -> impl Iterator<Item=Self::V> {
-        self.node(node).unwrap().neighbours().iter().map(|x|x.node)
+    fn neighbours(&self, node:&Self::V, time: i64) -> impl Iterator<Item=Self::V> {
+        self.at(time).node(node).unwrap().neighbours().iter().map(|x|x.node)
     }
 }
 
+pub enum PartitionType<'a, V>{
+    All,
+    Subset(&'a [V])
+}
+
+pub enum PartitionOutput<V>{
+    All(HashMap<V,usize>),
+    Subset(Vec<usize>)
+}
 
 /// Trait to be implemented by Clustering Algorithms that want to consume snapshot diffs 
-pub trait SnapshotClusteringAlg {
+pub trait SnapshotClusteringAlg<V> {
 
-    type PartitionOutput;
 
     /// Called before any ops at this snapshot (optional)
     fn begin_snapshot(&mut self, time: i64) {}
 
     /// Apply a batch of edge updates
-    fn apply_edge_ops(&mut self, time: i64, ops: &[EdgeOp]);
+    fn apply_edge_ops(&mut self, time: i64, ops: &[ExtendedEdgeOp<V>], graph: &impl GraphLike);
 
     /// Called after all ops are applied at this snapshot
-    fn extract_partition(&mut self, time: i64) -> Self::PartitionOutput;
+    fn extract_partition(&mut self, time: i64, part_type: PartitionType<V>, graph: &impl GraphLike) -> PartitionOutput<V>;
 
     /// Convenience: process all diffs and collect partitions per snapshot.
-    fn process_diffs_collect(
+    fn process_diffs(
         &mut self,
-        diffs: &SnapshotDiffs,
-    ) -> Vec<(i64, Self::PartitionOutput)> {
+        diffs: &SnapshotDiffs<V>,
+        graph: &impl GraphLike,
+    ) -> Vec<(i64, PartitionOutput<V>)> {
         let mut out = Vec::with_capacity(diffs.snapshot_times.len());
         for (t, diff) in diffs.iter() {
             let time = *t;
             self.begin_snapshot(time);
-            self.apply_edge_ops(time, diff);
-            let partition = self.extract_partition(time);
+            self.apply_edge_ops(time, diff, graph);
+            let partition = self.extract_partition(time, PartitionType::All, graph);
             out.push((time, partition));
         }
         out
     }
 
     /// Convenience: process diffs and feed each snapshot partition to a callback.
-    fn process_diffs_with<F>(
+    fn process_diffs_with_subset(
         &mut self,
-        diffs: &SnapshotDiffs,
-        mut on_snapshot: F,
-    ) where
-        F: FnMut(i64, &Self::PartitionOutput),
-    {
+        diffs: &SnapshotDiffs<V>,
+        graph: &impl GraphLike,
+        mut subset: Vec<V>,
+    )
+    {   
+        let mut out = Vec::with_capacity(diffs.snapshot_times.len());
         for (t, diff) in diffs.iter() {
             let time = *t;
             self.begin_snapshot(time);
-            self.apply_edge_ops(time, diff);
-            let partition = self.extract_partition(time);
-            on_snapshot(time, &partition);
+            self.apply_edge_ops(time, diff, graph);
+            let partition = self.extract_partition(time, PartitionType::Subset(&subset), graph);
+            out.push((time, partition));
         }
     }
 }
@@ -72,17 +83,17 @@ pub trait SnapshotClusteringAlg {
 
 
 
+#[derive(Default)]
 pub struct MyClustering{
     adj: HashMap<VID,HashMap<VID,f64>>,
     partition: HashMap<VID, usize>
 }
 
-impl SnapshotClusteringAlg for MyClustering{
-    type PartitionOutput = HashMap<VID, usize>;
-    
-    fn apply_edge_ops(&mut self, time: i64, ops: &[EdgeOp]) {
+impl SnapshotClusteringAlg<VID> for MyClustering{
+
+    fn apply_edge_ops(&mut self, _time: i64, ops: &[ExtendedEdgeOp<VID>], _graph: &impl GraphLike) {
         for op in ops{
-            match *op{ 
+            match op.edge_op(){ 
                 EdgeOp::Update(src,dst, w) => {
                     *self.adj
                         .entry(src)
@@ -95,7 +106,7 @@ impl SnapshotClusteringAlg for MyClustering{
                         .entry(src)
                         .or_default() += w;
                 },
-                EdgeOp::Delete(src, dst) =>{
+                EdgeOp::DeleteEdge(src, dst, cur_edge_weight) =>{
                     if let Some(neigh) = self.adj.get_mut(&src){
                         neigh.remove(&dst);
                         if neigh.is_empty(){
@@ -114,8 +125,15 @@ impl SnapshotClusteringAlg for MyClustering{
         self.partition = self.adj.keys().enumerate().map(|(i,x)| (*x,i)).collect();
     }
     
-    fn extract_partition(&mut self, time: i64) -> Self::PartitionOutput {
-        self.partition.clone()
+    fn extract_partition(&mut self, _time: i64, part_type: PartitionType<VID>, _graph: &impl GraphLike) -> PartitionOutput<VID> {
+        match part_type{
+            PartitionType::All => PartitionOutput::All(self.partition.clone()),
+            PartitionType::Subset(items) => {
+                PartitionOutput::Subset(
+                    items.iter().map(|x| *self.partition.get(x).unwrap()).collect::<Vec<usize>>()
+                )
+            },
+        }
     }
 }
 
