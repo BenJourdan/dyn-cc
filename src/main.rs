@@ -10,6 +10,7 @@ use core::time;
 use raphtory::{core::entities::VID, prelude::*};
 use raphtory::db::graph::views::deletion_graph::PersistentGraph;
 use indicatif::ProgressBar;
+use std::time::{Instant, Duration};
 
 use tests::{
     generate_commands,
@@ -33,6 +34,8 @@ fn main(){
     let pb = ProgressBar::new(num_updates as u64);
     pb.set_style(indicatif::ProgressStyle::default_bar()
         .template("{spinner:.green} {bar:.green/yellow} {decimal_bytes_per_sec} {eta} [{elapsed_precise}] ").unwrap());
+
+    let t0 = Instant::now();
 
     for command in commands{
         pb.inc(1);
@@ -83,6 +86,7 @@ fn main(){
         }
     }
     pb.finish_with_message("processed updates");
+    println!("Graph build time: {:?}", t0.elapsed());
 
     let start = graph.earliest_time().unwrap();
     let end = graph.latest_time().unwrap();
@@ -90,14 +94,15 @@ fn main(){
 
     println!("{end}");
 
+
+    let t1 = Instant::now();
     let diffs = build_snapshot_diffs(&graph, start, end, 500, "w", 1e-9).unwrap();
+    println!("Diff build time: {:?}", t1.elapsed());
 
-    println!("Built {} diffs", diffs.snapshot_diffs.len());
-    println!("{:?}", diffs.node_diffs.last());
-
+    let t2 = Instant::now();
     let mut cluster_alg: DynamicClustering<8, VID> = alg::DynamicClustering::new(1000.0.into());
-
+    
     let part = cluster_alg.process_node_diffs(&diffs, &graph);
-    println!("{:?}", part.last().unwrap());
+    println!("Clustering time: {:?}", t2.elapsed());
 
 }

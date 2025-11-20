@@ -1,5 +1,5 @@
 use std::{collections::{HashMap, HashSet}, fmt::Debug};
-use crate::{diff::{ExtendedEdgeOp, NodeOps}, snapshot_clustering::{
+use crate::{alg::TreeData, diff::{ExtendedEdgeOp, NodeOps}, snapshot_clustering::{
     GraphLike, PartitionOutput, PartitionType, SnapshotClusteringAlg}};
 use raphtory::db::graph::node;
 use rayon::prelude::*;
@@ -356,6 +356,8 @@ impl <const ARITY: usize, V: std::hash::Hash + Eq + Clone + Copy> DynamicCluster
             self.tree_data.size[idx] = 1;
             self.tree_data.volume[idx] = *d;
             update_set.insert(idx);
+            // also reinsert into degree queue
+            self.degrees.push(*v, convert(*d));
         });
     }
 
@@ -373,6 +375,8 @@ impl <const ARITY: usize, V: std::hash::Hash + Eq + Clone + Copy> DynamicCluster
             debug_assert!(self.tree_data.volume[idx] != Volume(0.0.into()));
             self.tree_data.volume[idx] = *d;
             update_set.insert(idx);
+            // also update degree queue
+            self.degrees.push(*v, convert(*d));
         });
     }
 
@@ -389,7 +393,61 @@ impl <const ARITY: usize, V: std::hash::Hash + Eq + Clone + Copy> DynamicCluster
             self.tree_data.size[idx] = 0;
             self.tree_data.volume[idx] = Volume(0.0.into());
             update_set.insert(idx);
+            // also remove from degree queue
+            self.degrees.push(*v, NodeDegree::zero());
         });
+    }
+
+    pub fn apply_updates_from_set<F: Fn(&mut Self, TreeIndex)>(&mut self, update_set: &HashSet<TreeIndex>, f: F){
+
+        if update_set.is_empty(){
+            return;
+        }
+
+        let mut current = HashSet::new();
+        let mut bottom = HashSet::new();
+        
+
+        let total = self.num_total_nodes();
+        let n = total as f64;
+        let d = ARITY as f64;
+
+        // For a full d-ary tree:
+        // N = (d^(h+1) - 1)/(d-1) -> h = log_d((d-1)N + 1) - 1
+        // We floor h here; for a complete tree this gives the deepest *full* level,
+        // and the "bottom" level is either h or h+1, but the boundary
+        // (first index of deepest level) is still:
+        //   l_bottom_start = (d^h - 1)/(d-1)
+        let h = (((d - 1.0) * n + 1.0).log(d)).floor() as u32 - 1;
+        let l_bottom_start = (ARITY.pow(h) - 1) / (ARITY - 1);
+
+        for &idx in update_set.iter(){
+            if idx.0 >= l_bottom_start{
+                bottom.insert(idx);
+            } else {
+                current.insert(idx);
+            }
+        }
+
+        // process bottom set first, then merge with top set
+        let bottom_parents: HashSet<TreeIndex> = bottom.into_iter().map(|child_idx|{
+            self.parent_index(child_idx).unwrap()
+        }).collect();
+        for p_idx in bottom_parents.iter(){
+            f(self, *p_idx);
+        }
+
+        current.extend(bottom_parents.into_iter());
+
+        // process until current is empty
+        while !current.is_empty(){
+            current = current.into_iter().filter_map(|child_idx|{
+                self.parent_index(child_idx)
+            }).collect::<HashSet<_>>();
+            for p_idx in current.iter(){
+                f(self, *p_idx);
+            }
+        }
     }
 
 }
