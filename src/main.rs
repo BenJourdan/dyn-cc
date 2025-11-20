@@ -3,10 +3,11 @@
 mod tests;
 mod diff;
 mod snapshot_clustering;
+mod alg;
 use core::time;
 
 
-use raphtory::prelude::*;
+use raphtory::{core::entities::VID, prelude::*};
 use raphtory::db::graph::views::deletion_graph::PersistentGraph;
 use indicatif::ProgressBar;
 
@@ -18,7 +19,7 @@ use tests::{
 use diff::build_snapshot_diffs;
 use snapshot_clustering::{MyClustering};
 
-use crate::snapshot_clustering::SnapshotClusteringAlg;
+use crate::{alg::DynamicClustering, snapshot_clustering::SnapshotClusteringAlg};
 
 
 
@@ -89,12 +90,14 @@ fn main(){
 
     println!("{end}");
 
-    let diffs = build_snapshot_diffs(&graph, start, end, 500, "w").unwrap();
+    let diffs = build_snapshot_diffs(&graph, start, end, 500, "w", 1e-9).unwrap();
 
     println!("Built {} diffs", diffs.snapshot_diffs.len());
+    println!("{:?}", diffs.node_diffs.last());
 
-    let mut cluster_alg = MyClustering::new();
+    let mut cluster_alg: DynamicClustering<8, VID> = alg::DynamicClustering::new(1000.0.into());
 
-    cluster_alg.process_diffs(&diffs, &graph);
+    let part = cluster_alg.process_node_diffs(&diffs, &graph);
+    println!("{:?}", part.last().unwrap());
 
 }

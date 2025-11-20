@@ -2,7 +2,7 @@ use raphtory::prelude::{Graph, NodeViewOps, TimeOps};
 use raphtory::{core::entities::VID, prelude::GraphViewOps};
 use raphtory::db::graph::views::deletion_graph::PersistentGraph;
 
-use crate::diff::{EdgeOp, SnapshotDiffs, ExtendedEdgeOp};
+use crate::diff::{EdgeOp, ExtendedEdgeOp, NodeOps, SnapshotDiffs};
 
 use std::default;
 use std::{collections::HashMap, hash::Hash, ops::DerefMut};
@@ -25,6 +25,7 @@ pub enum PartitionType<'a, V>{
     Subset(&'a [V])
 }
 
+#[derive(Debug)]
 pub enum PartitionOutput<V>{
     All(HashMap<V,usize>),
     Subset(Vec<usize>)
@@ -38,19 +39,37 @@ pub trait SnapshotClusteringAlg<V> {
     fn begin_snapshot(&mut self, time: i64) {}
 
     /// Apply a batch of edge updates
-    fn apply_edge_ops(&mut self, time: i64, ops: &[ExtendedEdgeOp<V>], graph: &impl GraphLike);
+    fn apply_edge_ops(&mut self, time: i64, ops:&[ExtendedEdgeOp<V>], graph: &impl GraphLike);
+
+    fn apply_node_ops(&mut self, time: i64, ops: &NodeOps<V>, graph: &impl GraphLike);
 
     /// Called after all ops are applied at this snapshot
     fn extract_partition(&mut self, time: i64, part_type: PartitionType<V>, graph: &impl GraphLike) -> PartitionOutput<V>;
 
     /// Convenience: process all diffs and collect partitions per snapshot.
-    fn process_diffs(
+    fn process_node_diffs(
         &mut self,
         diffs: &SnapshotDiffs<V>,
         graph: &impl GraphLike,
     ) -> Vec<(i64, PartitionOutput<V>)> {
         let mut out = Vec::with_capacity(diffs.snapshot_times.len());
-        for (t, diff) in diffs.iter() {
+        for (t, diff) in diffs.iter_node_diffs() {
+            let time = *t;
+            self.begin_snapshot(time);
+            self.apply_node_ops(time, diff, graph);
+            let partition = self.extract_partition(time, PartitionType::All, graph);
+            out.push((time, partition));
+        }
+        out
+    }
+
+    fn process_edge_diffs(
+        &mut self,
+        diffs: &SnapshotDiffs<V>,
+        graph: &impl GraphLike,
+    ) -> Vec<(i64, PartitionOutput<V>)> {
+        let mut out = Vec::with_capacity(diffs.snapshot_times.len());
+        for (t, diff) in diffs.iter_edge_diffs() {
             let time = *t;
             self.begin_snapshot(time);
             self.apply_edge_ops(time, diff, graph);
@@ -60,8 +79,8 @@ pub trait SnapshotClusteringAlg<V> {
         out
     }
 
-    /// Convenience: process diffs and feed each snapshot partition to a callback.
-    fn process_diffs_with_subset(
+
+    fn process_node_diffs_with_subset(
         &mut self,
         diffs: &SnapshotDiffs<V>,
         graph: &impl GraphLike,
@@ -69,7 +88,24 @@ pub trait SnapshotClusteringAlg<V> {
     )
     {   
         let mut out = Vec::with_capacity(diffs.snapshot_times.len());
-        for (t, diff) in diffs.iter() {
+        for (t, diff) in diffs.iter_node_diffs() {
+            let time = *t;
+            self.begin_snapshot(time);
+            self.apply_node_ops(time, diff, graph);
+            let partition = self.extract_partition(time, PartitionType::Subset(&subset), graph);
+            out.push((time, partition));
+        }
+    }
+
+    fn process_edge_diffs_with_subset(
+        &mut self,
+        diffs: &SnapshotDiffs<V>,
+        graph: &impl GraphLike,
+        mut subset: Vec<V>,
+    )
+    {   
+        let mut out = Vec::with_capacity(diffs.snapshot_times.len());
+        for (t, diff) in diffs.iter_edge_diffs() {
             let time = *t;
             self.begin_snapshot(time);
             self.apply_edge_ops(time, diff, graph);
@@ -90,6 +126,10 @@ pub struct MyClustering{
 }
 
 impl SnapshotClusteringAlg<VID> for MyClustering{
+
+    fn apply_node_ops(&mut self, time: i64, ops: &NodeOps<VID>, graph: &impl GraphLike) {
+        
+    }
 
     fn apply_edge_ops(&mut self, _time: i64, ops: &[ExtendedEdgeOp<VID>], _graph: &impl GraphLike) {
         for op in ops{

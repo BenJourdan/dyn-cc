@@ -1,12 +1,13 @@
 mod common;
 mod tree_impls;
 
-use std::{collections::HashMap, fmt::Debug};
+use std::{collections::HashMap, fmt::Debug, hash::Hash};
 use crate::{diff::ExtendedEdgeOp, snapshot_clustering::{
     GraphLike, PartitionOutput, PartitionType, SnapshotClusteringAlg}};
 use rayon::prelude::*;
 
-use crate::diff::EdgeOp;
+use crate::diff::{EdgeOp, NodeOps};
+use crate::alg::common::reinterpret_slice;
 
 use common::*;
 use priority_queue::PriorityQueue;
@@ -49,28 +50,17 @@ pub struct DynamicClustering<const ARITY: usize, V>{
 
 
 
-impl <const ARITY: usize, V: std::hash::Hash+Eq> SnapshotClusteringAlg<V> for DynamicClustering<ARITY, V>{
+impl <const ARITY: usize, V: std::hash::Hash+Eq+Clone + Copy> SnapshotClusteringAlg<V> for DynamicClustering<ARITY, V>{
     fn apply_edge_ops(&mut self, time: i64, ops: &[ExtendedEdgeOp<V>], graph: &impl GraphLike) {
+    }
 
-        // clear buffers
-        self.node_creation_buffer.0.clear();
-        self.node_creation_buffer.1.clear();
+    fn apply_node_ops(&mut self, _time: i64, ops: &NodeOps<V>, _graph: &impl GraphLike) {
+        debug_assert_eq!(ops.created_fresh.0.len(), ops.created_fresh.1.len());
 
-        ops.iter().for_each(|op|{
-            match op{
-                ExtendedEdgeOp::SrcDstPresentUpdate(src, dst, w) => todo!(),
-                ExtendedEdgeOp::SrcMissingUpdate(src, dst, w) => {
-                    debug_assert!(!self.node_to_tree_map.contains_key(src));
-                    debug_assert!(self.node_to_tree_map.contains_key(&dst));
-
-                },
-            }
-        });
-        
-        todo!()
+        self.insert_fresh_nodes(ops);
     }
 
     fn extract_partition(&mut self, time: i64, part_type: PartitionType<V>, graph: &impl GraphLike) -> PartitionOutput<V> {
-        todo!()
+        PartitionOutput::All(HashMap::new())
     }
 }

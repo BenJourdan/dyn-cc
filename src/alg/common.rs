@@ -89,9 +89,10 @@ impl fmt::Display for NodeIdentity {
 macro_rules! newtypes {
     ($($name:ident),*) => {
         $(
-            #[repr(align(64))]
+            #[repr(transparent)]
             #[derive(Debug, Copy, Clone, Eq, PartialEq, PartialOrd, Ord, Hash)]
             pub struct $name(pub Float);
+            unsafe impl ReprAsF64 for $name {}
         )*
     };
 }
@@ -112,6 +113,34 @@ newtypes!(
 pub trait QuackLikeAFloat {
     fn into_float(self) -> Float;
     fn from_float(x: Float) -> Self;
+}
+
+/// Marker for types that are guaranteed to have the same representation as `f64`
+/// (via a transparent wrapper chain). This lets us provide zero-copy casts.
+pub unsafe trait ReprAsF64 {}
+unsafe impl ReprAsF64 for f64 {}
+unsafe impl ReprAsF64 for Float {}
+
+
+/// Zero-copy reinterpret a vector of `T` as a vector of `U`.
+/// Both `T` and `U` must be transparent wrappers over the same base representation (f64).
+pub fn reinterpret_vec<T: ReprAsF64, U: ReprAsF64>(v: Vec<T>) -> Vec<U> {
+    use std::mem::{align_of, size_of};
+    assert_eq!(size_of::<T>(), size_of::<U>());
+    assert_eq!(align_of::<T>(), align_of::<U>());
+    let len = v.len();
+    let cap = v.capacity();
+    let ptr = v.as_ptr();
+    std::mem::forget(v);
+    unsafe { Vec::from_raw_parts(ptr as *mut U, len, cap) }
+}
+
+/// Zero-copy reinterpret a slice of `T` as a slice of `U`.
+pub fn reinterpret_slice<T: ReprAsF64, U: ReprAsF64>(s: &[T]) -> &[U] {
+    use std::mem::{align_of, size_of};
+    assert_eq!(size_of::<T>(), size_of::<U>());
+    assert_eq!(align_of::<T>(), align_of::<U>());
+    unsafe { std::slice::from_raw_parts(s.as_ptr() as *const U, s.len()) }
 }
 
 

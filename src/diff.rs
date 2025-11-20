@@ -1,3 +1,5 @@
+use std::collections::{HashMap, HashSet};
+
 use raphtory::prelude::*;
 use raphtory::db::graph::views::deletion_graph::PersistentGraph;
 
@@ -55,6 +57,25 @@ pub enum ExtendedEdgeOp<V>{
     BothRemoveDelete(V, V, f64), // Both endpoints are dangling after this edge deletion. Remove edge and both nodes (src,dst, edge_weight)
 }
 
+#[derive(PartialEq, PartialOrd, Debug)]
+pub struct NodeOps<V>{
+    pub created_fresh: (Vec<V>, Vec<f64>),
+    pub created_stale: (Vec<V>, Vec<f64>),
+    pub modified: (Vec<V>, Vec<f64>),
+    pub deleted: (Vec<V>, Vec<f64>),
+}
+
+impl<V> Default for NodeOps<V> {
+    fn default() -> Self {
+        Self {
+            created_fresh: (Vec::new(), Vec::new()),
+            created_stale: (Vec::new(), Vec::new()),
+            modified: (Vec::new(), Vec::new()),
+            deleted: (Vec::new(), Vec::new()),
+        }
+    }
+}
+
 impl <V: Copy> ExtendedEdgeOp<V>{
     pub fn edge_op(&self) -> EdgeOp<V>{
         match self{
@@ -72,33 +93,81 @@ impl <V: Copy> ExtendedEdgeOp<V>{
 }
 
 
-const DEGREE_EPS: f64 = 1e-9;
 
-fn near_zero(value: f64) -> bool {
-    value.abs() < DEGREE_EPS
+fn near_zero(value: f64, epsilon: f64) -> bool {
+    value.abs() < epsilon
 }
 
-pub fn extend_diffs<V: Copy+std::hash::Hash+Eq>(diffs: &Vec<Vec<EdgeOp<V>>>) -> Vec<Vec<ExtendedEdgeOp<V>>>{
+pub fn extend_diffs<V: Copy+std::hash::Hash+Eq>(diffs: &Vec<Vec<EdgeOp<V>>>, epsilon: f64) -> (Vec<Vec<ExtendedEdgeOp<V>>>, Vec<NodeOps<V>>){
+
+        fn edge_weight<V: Copy + std::hash::Hash + Eq>(
+            graph: &HashMap<V, HashMap<V, f64>>,
+            src: V,
+            dst: V,
+        ) -> f64 {
+            graph
+                .get(&src)
+                .and_then(|neighbors| neighbors.get(&dst))
+                .copied()
+                .unwrap_or(0.0)
+        }
+
+        fn set_edge_weight<V: Copy + std::hash::Hash + Eq>(
+            graph: &mut HashMap<V, HashMap<V, f64>>,
+            src: V,
+            dst: V,
+            weight: f64,
+            epsilon: f64
+        ) {
+            if near_zero(weight, epsilon) {
+                if let Some(neighbors) = graph.get_mut(&src) {
+                    neighbors.remove(&dst);
+                    if neighbors.is_empty() {
+                        graph.remove(&src);
+                    }
+                }
+            } else {
+                graph.entry(src).or_default().insert(dst, weight);
+            }
+        }
+
+        fn node_degree<V: Copy + std::hash::Hash + Eq>(
+            graph: &HashMap<V, HashMap<V, f64>>,
+            node: V,
+        ) -> f64 {
+            graph
+                .get(&node)
+                .map(|neighbors| neighbors.values().sum())
+                .unwrap_or(0.0)
+        }
+
+        let mut graph: HashMap<V,HashMap<V,f64>> = HashMap::new();
+        let mut ever_seen: HashSet<V> = HashSet::new();
 
         let mut extended_diffs = Vec::with_capacity(diffs.len());
-
-        let mut node_degrees: std::collections::HashMap<V, f64> = std::collections::HashMap::new();
+        let mut node_diffs = Vec::with_capacity(diffs.len());
 
         for diff in diffs{
             let mut extended_diff = Vec::with_capacity(diff.len());
+            let mut pre_snapshot_degrees: HashMap<V, f64> = HashMap::new();
+            let mut seen_nodes: HashSet<V> = HashSet::new();
+            let mut touched_nodes: Vec<V> = Vec::new();
+
+            let mut record_node = |node: V, graph: &HashMap<V, HashMap<V, f64>>| {
+                if seen_nodes.insert(node) {
+                    pre_snapshot_degrees.insert(node, node_degree(graph, node));
+                    touched_nodes.push(node);
+                }
+            };
+
             for op in diff{
                 match op{
                     EdgeOp::Update(s,d,w) => {
-                        let src_present = node_degrees
-                            .get(s)
-                            .copied()
-                            .map(|val| !near_zero(val))
-                            .unwrap_or(false);
-                        let dst_present = node_degrees
-                            .get(d)
-                            .copied()
-                            .map(|val| !near_zero(val))
-                            .unwrap_or(false);
+                        record_node(*s, &graph);
+                        record_node(*d, &graph);
+
+                        let src_present = !near_zero(node_degree(&graph, *s), epsilon);
+                        let dst_present = !near_zero(node_degree(&graph, *d), epsilon);
 
                         match (src_present,dst_present){
                             (false, false) => extended_diff.push(ExtendedEdgeOp::BothMissingUpdate(*s,*d,*w)),
@@ -106,42 +175,24 @@ pub fn extend_diffs<V: Copy+std::hash::Hash+Eq>(diffs: &Vec<Vec<EdgeOp<V>>>) -> 
                             (true, false) => extended_diff.push(ExtendedEdgeOp::DstMissingUpdate(*s,*d,*w)),
                             (true, true) => extended_diff.push(ExtendedEdgeOp::SrcDstPresentUpdate(*s,*d,*w)),
                         };
-                        let src_val = {
-                            let entry = node_degrees.entry(*s).or_insert(0.0);
-                            *entry += w;
-                            *entry
-                        };
-                        if near_zero(src_val) {
-                            node_degrees.remove(s);
+
+                        let current_weight = edge_weight(&graph, *s, *d);
+                        let mut new_weight = current_weight + *w;
+                        if near_zero(new_weight, epsilon) {
+                            new_weight = 0.0;
                         }
-                        let dst_val = {
-                            let entry = node_degrees.entry(*d).or_insert(0.0);
-                            *entry += w;
-                            *entry
-                        };
-                        if near_zero(dst_val) {
-                            node_degrees.remove(d);
-                        }
+                        set_edge_weight(&mut graph, *s, *d, new_weight, epsilon);
+                        set_edge_weight(&mut graph, *d, *s, new_weight, epsilon);
                     },
                     EdgeOp::DeleteEdge(s,d,x) => {
-                        let src_deleted = {
-                            let entry = node_degrees.entry(*s).or_insert(0.0);
-                            *entry -= x;
-                            let deleted = near_zero(*entry);
-                            if deleted {
-                                node_degrees.remove(s);
-                            }
-                            deleted
-                        };
-                        let dst_deleted = {
-                            let entry = node_degrees.entry(*d).or_insert(0.0);
-                            *entry -= x;
-                            let deleted = near_zero(*entry);
-                            if deleted {
-                                node_degrees.remove(d);
-                            }
-                            deleted
-                        };
+                        record_node(*s, &graph);
+                        record_node(*d, &graph);
+
+                        set_edge_weight(&mut graph, *s, *d, 0.0, epsilon);
+                        set_edge_weight(&mut graph, *d, *s, 0.0, epsilon);
+
+                        let src_deleted = near_zero(node_degree(&graph, *s), epsilon);
+                        let dst_deleted = near_zero(node_degree(&graph, *d), epsilon);
                         
                         match (src_deleted, dst_deleted){
                             (false, false) => extended_diff.push(ExtendedEdgeOp::SrcDstPresentDelete(*s,*d,*x)),
@@ -158,9 +209,36 @@ pub fn extend_diffs<V: Copy+std::hash::Hash+Eq>(diffs: &Vec<Vec<EdgeOp<V>>>) -> 
                     }
                 }
             }
+
+            let mut node_ops = NodeOps::default();
+            for node in touched_nodes {
+                let before = *pre_snapshot_degrees.get(&node).unwrap_or(&0.0);
+                let after = node_degree(&graph, node);
+
+                let before_present = !near_zero(before, epsilon);
+                let after_present = !near_zero(after, epsilon);
+
+                if before_present && !after_present {
+                    node_ops.deleted.0.push(node);
+                    node_ops.deleted.1.push(before);
+                } else if !before_present && after_present {
+                    if ever_seen.insert(node) {
+                        node_ops.created_fresh.0.push(node);
+                        node_ops.created_fresh.1.push(after);
+                    } else {
+                        node_ops.created_stale.0.push(node);
+                        node_ops.created_stale.1.push(after);
+                    }
+                } else if before_present && after_present && (before - after).abs() > epsilon {
+                    node_ops.modified.0.push(node);
+                    node_ops.modified.1.push(after);
+                }
+            }
+
+            node_diffs.push(node_ops);
             extended_diffs.push(extended_diff);
         }
-        extended_diffs
+        (extended_diffs, node_diffs)
 }
 
 
@@ -182,12 +260,16 @@ enum TemporalOp{
 #[derive(Debug)]
 pub struct SnapshotDiffs<V>{
     pub snapshot_times: Vec<i64>,
-    pub snapshot_diffs: Vec<Vec<ExtendedEdgeOp<V>>>
+    pub snapshot_diffs: Vec<Vec<ExtendedEdgeOp<V>>>,
+    pub node_diffs: Vec<NodeOps<V>>
 }
 
 impl<V> SnapshotDiffs<V>{
-    pub fn iter(&self) -> impl Iterator<Item = (&i64, &Vec<ExtendedEdgeOp<V>>)>{
+    pub fn iter_edge_diffs(&self) -> impl Iterator<Item = (&i64, &Vec<ExtendedEdgeOp<V>>)>{
         self.snapshot_times.iter().zip(self.snapshot_diffs.iter())
+    }
+    pub fn iter_node_diffs(&self) -> impl Iterator<Item = (&i64, &NodeOps<V>)>{
+        self.snapshot_times.iter().zip(self.node_diffs.iter())
     }
 }
 
@@ -280,7 +362,7 @@ fn snapshot_ops_for_timeline(
 ///   snapshot_times = [start, start + step_size, start + 2*step_size, ... , < end]
 ///
 /// `prop_name` is the edge property used as the weight.
-pub fn build_snapshot_diffs(graph: &PersistentGraph, start:i64, end: i64, step_size: usize, prop_name:&str) -> Result<SnapshotDiffs<VID>>{
+pub fn build_snapshot_diffs(graph: &PersistentGraph, start:i64, end: i64, step_size: usize, prop_name:&str, epsilon: f64) -> Result<SnapshotDiffs<VID>>{
 
     let graph_start = graph.earliest_time();
     let graph_end = graph.latest_time();
@@ -318,7 +400,7 @@ pub fn build_snapshot_diffs(graph: &PersistentGraph, start:i64, end: i64, step_s
 
     // For each edge, compute per-snapshot temporal ops, then convert them to EdgeOp
     // (delta updates / deletes), then merge the edge snapshots together.
-    let snapshot_diffs = graph.edges().iter().par_bridge().map(|edge|{
+    let edge_snapshot_diffs = graph.edges().iter().par_bridge().map(|edge|{
         let src = edge.edge.src();
         let dst = edge.edge.dst();
         let timeline = build_timeline(edge, prop_name);
@@ -337,7 +419,9 @@ pub fn build_snapshot_diffs(graph: &PersistentGraph, start:i64, end: i64, step_s
         acc
     });
 
-    Ok(SnapshotDiffs { snapshot_times, snapshot_diffs:extend_diffs(&snapshot_diffs) })
+    let (snapshot_diffs, node_diffs) = extend_diffs(&edge_snapshot_diffs, epsilon);
+
+    Ok(SnapshotDiffs { snapshot_times, snapshot_diffs, node_diffs })
 }
 
 
@@ -366,7 +450,8 @@ mod tests {
     fn extend_diffs_tracks_node_creation_and_deletion_with_tolerance() {
         let v1 = VID(1);
         let v2 = VID(2);
-        let tiny = DEGREE_EPS / 2.0;
+        let epsilon = 1e-9;
+        let tiny = epsilon / 2.0;
 
         let diffs = vec![
             vec![EdgeOp::Update(v1, v2, 1.0)],
@@ -375,8 +460,9 @@ mod tests {
             vec![EdgeOp::DeleteEdge(v1, v2, 0.2)],
         ];
 
-        let extended = extend_diffs(&diffs);
+        let (extended, node_diffs) = extend_diffs(&diffs, epsilon);
         assert_eq!(extended.len(), diffs.len());
+        assert_eq!(node_diffs.len(), diffs.len());
 
         match extended[0][0] {
             ExtendedEdgeOp::BothMissingUpdate(s, d, w) => {
@@ -409,6 +495,40 @@ mod tests {
             }
             _ => panic!("Expected BothRemoveDelete when the only edge is deleted"),
         }
+
+        let node_ops_to_map =
+            |ops: &NodeOps<VID>| -> HashMap<VID, (&str, f64)> {
+                let mut out = HashMap::new();
+                for (v, deg) in ops.created_fresh.0.iter().zip(ops.created_fresh.1.iter()) {
+                    out.insert(*v, ("created_fresh", *deg));
+                }
+                for (v, deg) in ops.created_stale.0.iter().zip(ops.created_stale.1.iter()) {
+                    out.insert(*v, ("created_stale", *deg));
+                }
+                for (v, deg) in ops.modified.0.iter().zip(ops.modified.1.iter()) {
+                    out.insert(*v, ("modified", *deg));
+                }
+                for (v, deg) in ops.deleted.0.iter().zip(ops.deleted.1.iter()) {
+                    out.insert(*v, ("deleted", *deg));
+                }
+                out
+            };
+
+        let created0 = node_ops_to_map(&node_diffs[0]);
+        assert!(matches!(created0.get(&v1), Some(("created_fresh", deg)) if approx_eq(*deg,1.0)));
+        assert!(matches!(created0.get(&v2), Some(("created_fresh", deg)) if approx_eq(*deg,1.0)));
+
+        let deleted1 = node_ops_to_map(&node_diffs[1]);
+        assert!(matches!(deleted1.get(&v1), Some(("deleted", _))));
+        assert!(matches!(deleted1.get(&v2), Some(("deleted", _))));
+
+        let created2 = node_ops_to_map(&node_diffs[2]);
+        assert!(matches!(created2.get(&v1), Some(("created_stale", deg)) if approx_eq(*deg,0.2)));
+        assert!(matches!(created2.get(&v2), Some(("created_stale", deg)) if approx_eq(*deg,0.2)));
+
+        let deleted3 = node_ops_to_map(&node_diffs[3]);
+        assert!(matches!(deleted3.get(&v1), Some(("deleted", deg)) if approx_eq(*deg,0.2)));
+        assert!(matches!(deleted3.get(&v2), Some(("deleted", deg)) if approx_eq(*deg,0.2)));
     }
 
     #[test]
@@ -552,11 +672,13 @@ mod tests {
         graph: &PersistentGraph,
         step_size: usize,
         prop: &str,
+        epsilon: f64,
     ) {
         let graph_start = graph.earliest_time().unwrap();
         let graph_end = graph.latest_time().unwrap();
         let diffs =
-            build_snapshot_diffs(graph, graph_start, graph_end, step_size, prop).unwrap();
+            build_snapshot_diffs(graph, graph_start, graph_end, step_size, prop, epsilon)
+                .unwrap();
         assert!(!diffs.snapshot_times.is_empty());
         assert_diffs_match_graph(graph, &diffs);
     }
@@ -577,7 +699,7 @@ mod tests {
         add_weight(&graph, 1, src, dst, 1.0);
         add_weight(&graph, 6, src, dst, 2.0);
 
-        let diffs = build_snapshot_diffs(&graph, 1, 6, 10, "w").unwrap();
+        let diffs = build_snapshot_diffs(&graph, 1, 6, 10, "w", EPS).unwrap();
         assert_eq!(diffs.snapshot_times, vec![1]);
 
         assert_diffs_match_graph(&graph, &diffs);
@@ -592,7 +714,7 @@ mod tests {
 
         let start = graph.earliest_time().unwrap();
         let end = graph.latest_time().unwrap();
-        let diffs = build_snapshot_diffs(&graph, start, end, 5, "w").unwrap();
+        let diffs = build_snapshot_diffs(&graph, start, end, 5, "w", EPS).unwrap();
 
         assert_diffs_match_graph(&graph, &diffs);
     }
@@ -604,7 +726,7 @@ mod tests {
         add_weight(&graph, 0, "u", "v", 3.0);
         graph.add_edge(5, "u", "v", [("w", Prop::F64(0.0))], None).unwrap();
 
-        assert_full_range_diffs_match_graph(&graph, 3, "w");
+        assert_full_range_diffs_match_graph(&graph, 3, "w", EPS);
     }
 
     #[test]
@@ -616,7 +738,7 @@ mod tests {
         add_weight(&graph, 10, "c", "a", 3.0);
         add_weight(&graph, 20, "a", "b", 0.0);
 
-        assert_full_range_diffs_match_graph(&graph, 5, "w");
+        assert_full_range_diffs_match_graph(&graph, 5, "w", EPS);
     }
 
     /// Random-ish graph, deterministic seed: diffs must replay to match graph.at()
@@ -654,7 +776,7 @@ mod tests {
             }
         }
 
-        assert_full_range_diffs_match_graph(&graph, 3, "w");
+        assert_full_range_diffs_match_graph(&graph, 3, "w", EPS);
     }
 
     // ============================================================
@@ -866,7 +988,7 @@ mod tests {
     #[test]
     fn build_snapshot_diffs_errors_on_empty_graph() {
         let graph = PersistentGraph::new();
-        let res = build_snapshot_diffs(&graph, 0, 10, 1, "w");
+        let res = build_snapshot_diffs(&graph, 0, 10, 1, "w", EPS);
         assert!(res.is_err());
     }
 
@@ -877,10 +999,10 @@ mod tests {
         let graph_start = graph.earliest_time().unwrap();
         let graph_end = graph.latest_time().unwrap();
 
-        let res = build_snapshot_diffs(&graph, graph_start - 1, graph_end, 1, "w");
+        let res = build_snapshot_diffs(&graph, graph_start - 1, graph_end, 1, "w", EPS);
         assert!(res.is_err());
 
-        let res = build_snapshot_diffs(&graph, graph_start, graph_end + 1, 1, "w");
+        let res = build_snapshot_diffs(&graph, graph_start, graph_end + 1, 1, "w", EPS);
         assert!(res.is_err());
     }
 
@@ -891,7 +1013,7 @@ mod tests {
         let graph_start = graph.earliest_time().unwrap();
         let graph_end = graph.latest_time().unwrap();
 
-        let res = build_snapshot_diffs(&graph, graph_start, graph_end, 0, "w");
+        let res = build_snapshot_diffs(&graph, graph_start, graph_end, 0, "w", EPS);
         assert!(res.is_err());
     }
 
@@ -904,7 +1026,7 @@ mod tests {
         let end = graph.latest_time().unwrap();
         assert_eq!(start, end);
 
-        let res = build_snapshot_diffs(&graph, start, end, 1, "w");
+        let res = build_snapshot_diffs(&graph, start, end, 1, "w", EPS);
         assert!(res.is_err());
     }
 }

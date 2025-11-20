@@ -1,6 +1,7 @@
-use std::{collections::HashMap, fmt::Debug};
-use crate::{diff::ExtendedEdgeOp, snapshot_clustering::{
+use std::{collections::{HashMap, HashSet}, fmt::Debug};
+use crate::{diff::{ExtendedEdgeOp, NodeOps}, snapshot_clustering::{
     GraphLike, PartitionOutput, PartitionType, SnapshotClusteringAlg}};
+use raphtory::db::graph::node;
 use rayon::prelude::*;
 
 
@@ -75,15 +76,20 @@ impl <const ARITY: usize, V: std::hash::Hash + Eq + Clone + Copy> DynamicCluster
     }
 
 
-    pub fn insert_new_nodes(&mut self, new_nodes: &[V], new_node_degrees: &[Volume]){
+    pub fn insert_fresh_nodes(&mut self, node_ops:&NodeOps<V>){
+
+    let fresh_nodes = node_ops.created_fresh.0.as_slice();
+    let fresh_node_degrees= reinterpret_slice::<f64, Volume>(
+        node_ops.created_fresh.1.as_slice()
+    );
     debug_assert_eq!(
-        new_nodes.len(),
-        new_node_degrees.len(),
+        fresh_nodes.len(),
+        fresh_node_degrees.len(),
         "new_nodes and new_node_degrees must have the same length"
     );
     debug_assert!(ARITY > 1, "ARITY must be at least 2");
 
-    let added = new_nodes.len();
+    let added = fresh_nodes.len();
     if added == 0 {
         return;
     }
@@ -129,11 +135,11 @@ impl <const ARITY: usize, V: std::hash::Hash + Eq + Clone + Copy> DynamicCluster
         let start_new = new_leaf_start + old_leaves;
         let end_new = start_new + added;
 
-        self.tree_data.volume[start_new..end_new].copy_from_slice(new_node_degrees);
+        self.tree_data.volume[start_new..end_new].copy_from_slice(fresh_node_degrees);
 
-        for (i, (&deg, node_ref)) in new_node_degrees
+        for (i, (&deg, node_ref)) in fresh_node_degrees
             .iter()
-            .zip(new_nodes.iter())
+            .zip(fresh_nodes.iter())
             .enumerate()
         {
             let node = node_ref;
@@ -175,11 +181,11 @@ impl <const ARITY: usize, V: std::hash::Hash + Eq + Clone + Copy> DynamicCluster
         let end_new = start_new + added;
         debug_assert_eq!(end_new, I1 + new_leaves);
 
-        self.tree_data.volume[start_new..end_new].copy_from_slice(new_node_degrees);
+        self.tree_data.volume[start_new..end_new].copy_from_slice(fresh_node_degrees);
 
-        for (i, (&deg, node_ref)) in new_node_degrees
+        for (i, (&deg, node_ref)) in fresh_node_degrees
             .iter()
-            .zip(new_nodes.iter())
+            .zip(fresh_nodes.iter())
             .enumerate()
         {
             let node = *node_ref;
@@ -335,11 +341,63 @@ impl <const ARITY: usize, V: std::hash::Hash + Eq + Clone + Copy> DynamicCluster
         }
     }
 
+    pub fn update_stale_nodes(&mut self, node_ops: &NodeOps<V>, update_set: &mut HashSet<TreeIndex>){
+        // insert nodes that have previously been deleted (but not removed from the tree)
+        // We add the indices to update to update_set
+
+        let stale_nodes = node_ops.created_stale.0.as_slice();
+        let stale_node_degrees = reinterpret_slice::<f64,Volume>(
+            node_ops.created_stale.1.as_slice()
+        );
+        stale_nodes.iter().zip(stale_node_degrees).for_each(|(v,d)|{
+            let idx = *self.node_to_tree_map.get(v).unwrap();
+            debug_assert!(self.tree_data.size[idx]==0);
+            debug_assert!(self.tree_data.volume[idx] == Volume(0.0.into()));
+            self.tree_data.size[idx] = 1;
+            self.tree_data.volume[idx] = *d;
+            update_set.insert(idx);
+        });
+    }
+
+    pub fn update_modified_nodes(&mut self, node_ops: &NodeOps<V>, update_set: &mut HashSet<TreeIndex>){
+        // insert nodes that have previously been deleted (but not removed from the tree)
+        // We add the indices to update to update_set
+
+        let modified_nodes = node_ops.modified.0.as_slice();
+        let modified_node_degrees = reinterpret_slice::<f64,Volume>(
+            node_ops.modified.1.as_slice()
+        );
+        modified_nodes.iter().zip(modified_node_degrees).for_each(|(v,d)|{
+            let idx = *self.node_to_tree_map.get(v).unwrap();
+            debug_assert!(self.tree_data.size[idx]==1);
+            debug_assert!(self.tree_data.volume[idx] != Volume(0.0.into()));
+            self.tree_data.volume[idx] = *d;
+            update_set.insert(idx);
+        });
+    }
+
+    pub fn update_deleted_nodes(&mut self, node_ops: &NodeOps<V>, update_set: &mut HashSet<TreeIndex>){
+        // insert nodes that have previously been deleted (but not removed from the tree)
+        // We add the indices to update to update_set
+
+        let deleted_nodes = node_ops.deleted.0.as_slice();
+        
+        deleted_nodes.iter().for_each(|v|{
+            let idx = *self.node_to_tree_map.get(v).unwrap();
+            debug_assert!(self.tree_data.size[idx]==1);
+            debug_assert!(self.tree_data.volume[idx] != Volume(0.0.into()));
+            self.tree_data.size[idx] = 0;
+            self.tree_data.volume[idx] = Volume(0.0.into());
+            update_set.insert(idx);
+        });
+    }
+
 }
 
 #[cfg(test)]
 mod tests {
     use super::{DynamicClustering, Float, TreeIndex, Volume};
+    use crate::diff::NodeOps;
 
     type TestClustering = DynamicClustering<2, usize>;
 
@@ -351,11 +409,18 @@ mod tests {
         values.iter().copied().map(vol).collect()
     }
 
+    fn fresh_ops(nodes: &[usize], degrees: &[f64]) -> NodeOps<usize> {
+        NodeOps {
+            created_fresh: (nodes.to_vec(), degrees.to_vec()),
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn insert_new_nodes_handles_height_changes() {
         let mut clustering = TestClustering::new(Float::from(0.0));
 
-        clustering.insert_new_nodes(&[1, 2], &vols(&[1.0, 2.0]));
+        clustering.insert_fresh_nodes(&fresh_ops(&[1, 2], &[1.0, 2.0]));
         assert_eq!(clustering.num_leaves(), 2);
         assert_eq!(clustering.num_internal_nodes(), 1);
         assert_eq!(clustering.tree_data.volume[TreeIndex(0)], vol(3.0));
@@ -370,7 +435,7 @@ mod tests {
             Some(TreeIndex(2))
         );
 
-        clustering.insert_new_nodes(&[3], &vols(&[3.0]));
+        clustering.insert_fresh_nodes(&fresh_ops(&[3], &[3.0]));
         assert_eq!(clustering.num_leaves(), 3);
         assert_eq!(clustering.num_internal_nodes(), 2);
 
@@ -396,7 +461,7 @@ mod tests {
     #[test]
     fn rebuild_from_leaves_updates_multiple_levels() {
         let mut clustering = TestClustering::new(Float::from(0.0));
-        clustering.insert_new_nodes(&[10, 11, 12, 13, 14], &vols(&[1.0, 2.0, 3.0, 4.0, 5.0]));
+        clustering.insert_fresh_nodes(&fresh_ops(&[10, 11, 12, 13, 14], &[1.0, 2.0, 3.0, 4.0, 5.0]));
 
         for (idx, value) in [(5usize, 10.0), (6, 20.0), (7, 7.0), (8, 9.0)] {
             clustering.tree_data.volume[TreeIndex(idx)] = vol(value);
