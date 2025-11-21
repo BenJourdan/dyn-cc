@@ -46,6 +46,8 @@ pub struct DynamicClustering<const ARITY: usize, V>{
     pub timestamp: usize,
 
     pub node_creation_buffer: (Vec<V>, Vec<NodeDegree>),
+
+    pub update_set: HashSet<TreeIndex>,
 }
 
 
@@ -54,13 +56,15 @@ impl <const ARITY: usize, V: std::hash::Hash+Eq+Clone + Copy> SnapshotClustering
     fn apply_edge_ops(&mut self, time: i64, ops: &[ExtendedEdgeOp<V>], graph: &impl GraphLike) {
     }
 
-    fn apply_node_ops(&mut self, _time: i64, ops: &NodeOps<V>, _graph: &impl GraphLike) {
+    fn apply_node_ops(&mut self, time: i64, ops: &NodeOps<V>, _graph: &impl GraphLike) {
         debug_assert_eq!(ops.created_fresh.0.len(), ops.created_fresh.1.len());
 
         // process fresh nodes
         self.insert_fresh_nodes(ops);
 
-        let mut update_set = HashSet::new();
+        // take the update set to avoid double borrowing
+        let mut update_set = std::mem::take(&mut self.update_set);
+        update_set.clear();
         // process stale nodes
         self.update_stale_nodes(ops, &mut update_set);
 
@@ -89,6 +93,9 @@ impl <const ARITY: usize, V: std::hash::Hash+Eq+Clone + Copy> SnapshotClustering
             // update volume for modified nodes
             other.tree_data.volume[idx] = other.tree_data.volume[first_child..stop].iter().sum();
         });
+
+        // restore the update set
+        self.update_set = update_set;
 
     }
 

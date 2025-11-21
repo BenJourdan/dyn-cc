@@ -22,6 +22,7 @@ impl <const ARITY: usize, V: std::hash::Hash + Eq + Clone + Copy> DynamicCluster
             sigma,
             timestamp: 0,
             node_creation_buffer: (Vec::new(), Vec::new()),
+            update_set: HashSet::new(),
         }
     }
 
