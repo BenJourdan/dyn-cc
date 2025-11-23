@@ -1,7 +1,6 @@
 pub mod diff;
 pub mod snapshot_clustering;
-mod alg;
+pub mod alg;
 
 #[cfg(test)]
 mod tests;
-

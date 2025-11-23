@@ -13,9 +13,19 @@ debug = true
 
 [dependencies]
 anyhow = "1.0.100"
+faer = "0.23.2"
 indicatif = "0.18.2"
+itertools = "0.14.0"
 ordered-float = "5.1.0"
 priority-queue = "2.7.0"
 rand = "0.9.2"
 raphtory = "0.16.3"
 rayon = "1.11.0"
+rustc-hash = "1.1"
+
+[dev-dependencies]
+criterion = "0.5"
+
+[[bench]]
+name = "process_node_diffs"
+harness = false

@@ -1,7 +1,9 @@
 mod common;
 mod tree_impls;
+mod coreset_impls;
+mod sampling_impls;
 
-use std::{collections::{HashMap, HashSet}, fmt::Debug, hash::Hash};
+use std::{fmt::Debug, hash::Hash};
 use crate::{diff::ExtendedEdgeOp, snapshot_clustering::{
     GraphLike, PartitionOutput, PartitionType, SnapshotClusteringAlg}};
 use rayon::prelude::*;
@@ -11,8 +13,7 @@ use crate::alg::common::reinterpret_slice;
 
 use common::*;
 use priority_queue::PriorityQueue;
-
-
+use rustc_hash::{FxHashMap, FxHashSet};
 
 #[derive(Default, Debug)]
 pub struct TreeData<const ARITY: usize> {
@@ -30,9 +31,9 @@ pub struct TreeData<const ARITY: usize> {
 pub struct DynamicClustering<const ARITY: usize, V>{
 
     // Map stable unique node Ids to tree indices
-    pub node_to_tree_map: HashMap<V, TreeIndex>,
+    pub node_to_tree_map: FxHashMap<V, TreeIndex>,
     // and the reverse map:
-    pub tree_to_node_map: HashMap<TreeIndex,V>,
+    pub tree_to_node_map: FxHashMap<TreeIndex,V>,
 
     // degree priority queue
     pub degrees: PriorityQueue<V, NodeDegree>,
@@ -43,11 +44,11 @@ pub struct DynamicClustering<const ARITY: usize, V>{
     // sigma shift to set
     pub sigma: Float,
 
+    // For lazy query time updates
     pub timestamp: usize,
 
-    pub node_creation_buffer: (Vec<V>, Vec<NodeDegree>),
 
-    pub update_set: HashSet<TreeIndex>,
+    pub update_set: FxHashSet<TreeIndex>,
 }
 
 
@@ -100,6 +101,6 @@ impl <const ARITY: usize, V: std::hash::Hash+Eq+Clone + Copy> SnapshotClustering
     }
 
     fn extract_partition(&mut self, time: i64, part_type: PartitionType<V>, graph: &impl GraphLike) -> PartitionOutput<V> {
-        PartitionOutput::All(HashMap::new())
+        PartitionOutput::All(FxHashMap::default())
     }
 }

@@ -5,7 +5,8 @@ use raphtory::db::graph::views::deletion_graph::PersistentGraph;
 use crate::diff::{EdgeOp, ExtendedEdgeOp, NodeOps, SnapshotDiffs};
 
 use std::default;
-use std::{collections::HashMap, hash::Hash, ops::DerefMut};
+use std::{hash::Hash, ops::DerefMut};
+use rustc_hash::FxHashMap;
 
 pub trait GraphLike{
     type V;
@@ -27,7 +28,7 @@ pub enum PartitionType<'a, V>{
 
 #[derive(Debug)]
 pub enum PartitionOutput<V>{
-    All(HashMap<V,usize>),
+    All(FxHashMap<V,usize>),
     Subset(Vec<usize>)
 }
 
@@ -121,8 +122,8 @@ pub trait SnapshotClusteringAlg<V> {
 
 #[derive(Default)]
 pub struct MyClustering{
-    adj: HashMap<VID,HashMap<VID,f64>>,
-    partition: HashMap<VID, usize>
+    adj: FxHashMap<VID,FxHashMap<VID,f64>>,
+    partition: FxHashMap<VID, usize>
 }
 
 impl SnapshotClusteringAlg<VID> for MyClustering{
@@ -179,6 +180,6 @@ impl SnapshotClusteringAlg<VID> for MyClustering{
 
 impl MyClustering{
     pub fn new() -> Self{
-        MyClustering { adj: HashMap::new(), partition: HashMap::new() }
+        MyClustering { adj: FxHashMap::default(), partition: FxHashMap::default() }
     }
 }

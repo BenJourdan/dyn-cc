@@ -1,4 +1,4 @@
-use std::{collections::{HashMap, HashSet}, fmt::Debug};
+use std::fmt::Debug;
 use crate::{alg::TreeData, diff::{ExtendedEdgeOp, NodeOps}, snapshot_clustering::{
     GraphLike, PartitionOutput, PartitionType, SnapshotClusteringAlg}};
 use raphtory::db::graph::node;
@@ -7,6 +7,7 @@ use rayon::prelude::*;
 
 use super::common::*;
 use super::DynamicClustering;
+use rustc_hash::FxHashSet;
 
 
 
@@ -21,8 +22,7 @@ impl <const ARITY: usize, V: std::hash::Hash + Eq + Clone + Copy> DynamicCluster
             tree_data: Default::default(), 
             sigma,
             timestamp: 0,
-            node_creation_buffer: (Vec::new(), Vec::new()),
-            update_set: HashSet::new(),
+            update_set: FxHashSet::default(),
         }
     }
 
@@ -342,7 +342,7 @@ impl <const ARITY: usize, V: std::hash::Hash + Eq + Clone + Copy> DynamicCluster
         }
     }
 
-    pub fn update_stale_nodes(&mut self, node_ops: &NodeOps<V>, update_set: &mut HashSet<TreeIndex>){
+    pub fn update_stale_nodes(&mut self, node_ops: &NodeOps<V>, update_set: &mut FxHashSet<TreeIndex>){
         // insert nodes that have previously been deleted (but not removed from the tree)
         // We add the indices to update to update_set
 
@@ -362,7 +362,7 @@ impl <const ARITY: usize, V: std::hash::Hash + Eq + Clone + Copy> DynamicCluster
         });
     }
 
-    pub fn update_modified_nodes(&mut self, node_ops: &NodeOps<V>, update_set: &mut HashSet<TreeIndex>){
+    pub fn update_modified_nodes(&mut self, node_ops: &NodeOps<V>, update_set: &mut FxHashSet<TreeIndex>){
         // insert nodes that have previously been deleted (but not removed from the tree)
         // We add the indices to update to update_set
 
@@ -381,7 +381,7 @@ impl <const ARITY: usize, V: std::hash::Hash + Eq + Clone + Copy> DynamicCluster
         });
     }
 
-    pub fn update_deleted_nodes(&mut self, node_ops: &NodeOps<V>, update_set: &mut HashSet<TreeIndex>){
+    pub fn update_deleted_nodes(&mut self, node_ops: &NodeOps<V>, update_set: &mut FxHashSet<TreeIndex>){
         // insert nodes that have previously been deleted (but not removed from the tree)
         // We add the indices to update to update_set
 
@@ -399,14 +399,14 @@ impl <const ARITY: usize, V: std::hash::Hash + Eq + Clone + Copy> DynamicCluster
         });
     }
 
-    pub fn apply_updates_from_set<F: Fn(&mut Self, TreeIndex)>(&mut self, update_set: &HashSet<TreeIndex>, f: F){
+    pub fn apply_updates_from_set<F: Fn(&mut Self, TreeIndex)>(&mut self, update_set: &FxHashSet<TreeIndex>, f: F){
 
         if update_set.is_empty(){
             return;
         }
 
-        let mut current = HashSet::new();
-        let mut bottom = HashSet::new();
+        let mut current = FxHashSet::default();
+        let mut bottom = FxHashSet::default();
         
 
         let total = self.num_total_nodes();
@@ -431,7 +431,7 @@ impl <const ARITY: usize, V: std::hash::Hash + Eq + Clone + Copy> DynamicCluster
         }
 
         // process bottom set first, then merge with top set
-        let bottom_parents: HashSet<TreeIndex> = bottom.into_iter().map(|child_idx|{
+        let bottom_parents: FxHashSet<TreeIndex> = bottom.into_iter().map(|child_idx|{
             self.parent_index(child_idx).unwrap()
         }).collect();
         for p_idx in bottom_parents.iter(){
@@ -444,7 +444,7 @@ impl <const ARITY: usize, V: std::hash::Hash + Eq + Clone + Copy> DynamicCluster
         while !current.is_empty(){
             current = current.into_iter().filter_map(|child_idx|{
                 self.parent_index(child_idx)
-            }).collect::<HashSet<_>>();
+            }).collect::<FxHashSet<_>>();
             for p_idx in current.iter(){
                 f(self, *p_idx);
             }

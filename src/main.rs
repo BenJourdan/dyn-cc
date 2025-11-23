@@ -99,12 +99,13 @@ fn main(){
     let end = graph.latest_time().unwrap();
 
 
-    println!("{end}");
+    println!("start: {start}, end: {end}");
 
 
     let t1 = Instant::now();
-    let diffs = build_snapshot_diffs(&graph, start, end, 10_000, "w", 1e-9).unwrap();
+    let diffs = build_snapshot_diffs(&graph, start, end, 100_000, "w", 1e-9).unwrap();
     println!("Diff build time: {:?}", t1.elapsed());
+    println!("Number of diffs: {}", diffs.node_diffs.len());
 
     let t2 = Instant::now();
     let mut cluster_alg: DynamicClustering<8, VID> = alg::DynamicClustering::new(1000.0.into());
