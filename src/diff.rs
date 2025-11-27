@@ -1,52 +1,48 @@
 use std::collections::{HashMap, HashSet};
 
-use raphtory::prelude::*;
 use raphtory::db::graph::views::deletion_graph::PersistentGraph;
+use raphtory::prelude::*;
 
-use anyhow::{anyhow, Result};
-use rayon::prelude::*;
+use anyhow::{Result, anyhow};
 use raphtory::core::entities::VID;
 use raphtory::db::graph::edge::EdgeView;
-
-
-
+use rayon::prelude::*;
 
 // used to tell external data structures if just the edge has been deleted, or if the node is now a singleton
 // The value is the weight of the edge prior to deletion
 #[derive(PartialEq, PartialOrd, Debug)]
-pub enum DeletionEvent{
+pub enum DeletionEvent {
     Edge(f64),
-    Node(f64)
+    Node(f64),
 }
 
 #[derive(PartialEq, PartialOrd, Debug)]
-pub enum EdgeOp<V>{
-    Update(V,V, f64), // Add/remove this amount (src,dst,weight)
-    DeleteEdge(V,V, f64) // Clear the contribution of this edge (src,dst, edge_weight)
+pub enum EdgeOp<V> {
+    Update(V, V, f64),     // Add/remove this amount (src,dst,weight)
+    DeleteEdge(V, V, f64), // Clear the contribution of this edge (src,dst, edge_weight)
 }
 
-impl <V:Copy> EdgeOp<V>{
-    pub fn src(&self) -> V{
-        match self{
-            EdgeOp::Update(s,_,_) => *s,
-            EdgeOp::DeleteEdge(s,_,_) => *s
+impl<V: Copy> EdgeOp<V> {
+    pub fn src(&self) -> V {
+        match self {
+            EdgeOp::Update(s, _, _) => *s,
+            EdgeOp::DeleteEdge(s, _, _) => *s,
         }
     }
-    pub fn dst(&self) -> V{
-        match self{
-            EdgeOp::Update(_,d,_) => *d,
-            EdgeOp::DeleteEdge(_,d,_) => *d
+    pub fn dst(&self) -> V {
+        match self {
+            EdgeOp::Update(_, d, _) => *d,
+            EdgeOp::DeleteEdge(_, d, _) => *d,
         }
     }
 }
 
-
-/// Extended edge operations that take into account whether the source and/or destination nodes are 
-/// created/deleted as part of the edge operation. This can be used by algorithms which would otherwise 
+/// Extended edge operations that take into account whether the source and/or destination nodes are
+/// created/deleted as part of the edge operation. This can be used by algorithms which would otherwise
 /// have to work this out themselves (e.g., by maintaining a node degree map).
 #[derive(PartialEq, PartialOrd, Debug)]
-pub enum ExtendedEdgeOp<V>{
-    SrcDstPresentUpdate(V,V, f64), // Both endpoints exist. Add/remove this amount to the edge(src,dst,weight)
+pub enum ExtendedEdgeOp<V> {
+    SrcDstPresentUpdate(V, V, f64), // Both endpoints exist. Add/remove this amount to the edge(src,dst,weight)
     SrcMissingUpdate(V, V, f64), // Src node is missing. Add/remove this amount to the edge (src,dst,weight)
     DstMissingUpdate(V, V, f64), // Dst node is missing. Add/remove this amount to the edge (src,dst,weight)
     BothMissingUpdate(V, V, f64), // Both endpoints are missing. Add/remove this amount to the edge (src,dst,weight)
@@ -58,7 +54,7 @@ pub enum ExtendedEdgeOp<V>{
 }
 
 #[derive(PartialEq, PartialOrd, Debug)]
-pub struct NodeOps<V>{
+pub struct NodeOps<V> {
     pub created_fresh: (Vec<V>, Vec<f64>),
     pub created_stale: (Vec<V>, Vec<f64>),
     pub modified: (Vec<V>, Vec<f64>),
@@ -76,181 +72,191 @@ impl<V> Default for NodeOps<V> {
     }
 }
 
-impl <V: Copy> ExtendedEdgeOp<V>{
-    pub fn edge_op(&self) -> EdgeOp<V>{
-        match self{
-            ExtendedEdgeOp::SrcDstPresentUpdate(s,d,w) |
-            ExtendedEdgeOp::SrcMissingUpdate(s,d,w) |
-            ExtendedEdgeOp::DstMissingUpdate(s,d,w) |
-            ExtendedEdgeOp::BothMissingUpdate(s,d,w) => EdgeOp::Update(*s,*d,*w),
+impl<V: Copy> ExtendedEdgeOp<V> {
+    pub fn edge_op(&self) -> EdgeOp<V> {
+        match self {
+            ExtendedEdgeOp::SrcDstPresentUpdate(s, d, w)
+            | ExtendedEdgeOp::SrcMissingUpdate(s, d, w)
+            | ExtendedEdgeOp::DstMissingUpdate(s, d, w)
+            | ExtendedEdgeOp::BothMissingUpdate(s, d, w) => EdgeOp::Update(*s, *d, *w),
 
-            ExtendedEdgeOp::SrcDstPresentDelete(s,d,x) |
-            ExtendedEdgeOp::SrcRemoveDelete(s,d,x) |
-            ExtendedEdgeOp::DstRemoveDelete(s,d,x) |
-            ExtendedEdgeOp::BothRemoveDelete(s,d,x) => EdgeOp::DeleteEdge(*s,*d,*x),
+            ExtendedEdgeOp::SrcDstPresentDelete(s, d, x)
+            | ExtendedEdgeOp::SrcRemoveDelete(s, d, x)
+            | ExtendedEdgeOp::DstRemoveDelete(s, d, x)
+            | ExtendedEdgeOp::BothRemoveDelete(s, d, x) => EdgeOp::DeleteEdge(*s, *d, *x),
         }
     }
 }
-
-
 
 fn near_zero(value: f64, epsilon: f64) -> bool {
     value.abs() < epsilon
 }
 
-pub fn extend_diffs<V: Copy+std::hash::Hash+Eq>(diffs: &Vec<Vec<EdgeOp<V>>>, epsilon: f64) -> (Vec<Vec<ExtendedEdgeOp<V>>>, Vec<NodeOps<V>>){
+pub fn extend_diffs<V: Copy + std::hash::Hash + Eq>(
+    diffs: &Vec<Vec<EdgeOp<V>>>,
+    epsilon: f64,
+) -> (Vec<Vec<ExtendedEdgeOp<V>>>, Vec<NodeOps<V>>) {
+    fn edge_weight<V: Copy + std::hash::Hash + Eq>(
+        graph: &HashMap<V, HashMap<V, f64>>,
+        src: V,
+        dst: V,
+    ) -> f64 {
+        graph
+            .get(&src)
+            .and_then(|neighbors| neighbors.get(&dst))
+            .copied()
+            .unwrap_or(0.0)
+    }
 
-        fn edge_weight<V: Copy + std::hash::Hash + Eq>(
-            graph: &HashMap<V, HashMap<V, f64>>,
-            src: V,
-            dst: V,
-        ) -> f64 {
-            graph
-                .get(&src)
-                .and_then(|neighbors| neighbors.get(&dst))
-                .copied()
-                .unwrap_or(0.0)
-        }
-
-        fn set_edge_weight<V: Copy + std::hash::Hash + Eq>(
-            graph: &mut HashMap<V, HashMap<V, f64>>,
-            src: V,
-            dst: V,
-            weight: f64,
-            epsilon: f64
-        ) {
-            if near_zero(weight, epsilon) {
-                if let Some(neighbors) = graph.get_mut(&src) {
-                    neighbors.remove(&dst);
-                    if neighbors.is_empty() {
-                        graph.remove(&src);
-                    }
+    fn set_edge_weight<V: Copy + std::hash::Hash + Eq>(
+        graph: &mut HashMap<V, HashMap<V, f64>>,
+        src: V,
+        dst: V,
+        weight: f64,
+        epsilon: f64,
+    ) {
+        if near_zero(weight, epsilon) {
+            if let Some(neighbors) = graph.get_mut(&src) {
+                neighbors.remove(&dst);
+                if neighbors.is_empty() {
+                    graph.remove(&src);
                 }
-            } else {
-                graph.entry(src).or_default().insert(dst, weight);
             }
+        } else {
+            graph.entry(src).or_default().insert(dst, weight);
         }
+    }
 
-        fn node_degree<V: Copy + std::hash::Hash + Eq>(
-            graph: &HashMap<V, HashMap<V, f64>>,
-            node: V,
-        ) -> f64 {
-            graph
-                .get(&node)
-                .map(|neighbors| neighbors.values().sum())
-                .unwrap_or(0.0)
-        }
+    fn node_degree<V: Copy + std::hash::Hash + Eq>(
+        graph: &HashMap<V, HashMap<V, f64>>,
+        node: V,
+    ) -> f64 {
+        graph
+            .get(&node)
+            .map(|neighbors| neighbors.values().sum())
+            .unwrap_or(0.0)
+    }
 
-        let mut graph: HashMap<V,HashMap<V,f64>> = HashMap::new();
-        let mut ever_seen: HashSet<V> = HashSet::new();
+    let mut graph: HashMap<V, HashMap<V, f64>> = HashMap::new();
+    let mut ever_seen: HashSet<V> = HashSet::new();
 
-        let mut extended_diffs = Vec::with_capacity(diffs.len());
-        let mut node_diffs = Vec::with_capacity(diffs.len());
+    let mut extended_diffs = Vec::with_capacity(diffs.len());
+    let mut node_diffs = Vec::with_capacity(diffs.len());
 
-        for diff in diffs{
-            let mut extended_diff = Vec::with_capacity(diff.len());
-            let mut pre_snapshot_degrees: HashMap<V, f64> = HashMap::new();
-            let mut seen_nodes: HashSet<V> = HashSet::new();
-            let mut touched_nodes: Vec<V> = Vec::new();
+    for diff in diffs {
+        let mut extended_diff = Vec::with_capacity(diff.len());
+        let mut pre_snapshot_degrees: HashMap<V, f64> = HashMap::new();
+        let mut seen_nodes: HashSet<V> = HashSet::new();
+        let mut touched_nodes: Vec<V> = Vec::new();
 
-            let mut record_node = |node: V, graph: &HashMap<V, HashMap<V, f64>>| {
-                if seen_nodes.insert(node) {
-                    pre_snapshot_degrees.insert(node, node_degree(graph, node));
-                    touched_nodes.push(node);
-                }
-            };
+        let mut record_node = |node: V, graph: &HashMap<V, HashMap<V, f64>>| {
+            if seen_nodes.insert(node) {
+                pre_snapshot_degrees.insert(node, node_degree(graph, node));
+                touched_nodes.push(node);
+            }
+        };
 
-            for op in diff{
-                match op{
-                    EdgeOp::Update(s,d,w) => {
-                        record_node(*s, &graph);
-                        record_node(*d, &graph);
+        for op in diff {
+            match op {
+                EdgeOp::Update(s, d, w) => {
+                    record_node(*s, &graph);
+                    record_node(*d, &graph);
 
-                        let src_present = !near_zero(node_degree(&graph, *s), epsilon);
-                        let dst_present = !near_zero(node_degree(&graph, *d), epsilon);
+                    let src_present = !near_zero(node_degree(&graph, *s), epsilon);
+                    let dst_present = !near_zero(node_degree(&graph, *d), epsilon);
 
-                        match (src_present,dst_present){
-                            (false, false) => extended_diff.push(ExtendedEdgeOp::BothMissingUpdate(*s,*d,*w)),
-                            (false, true) => extended_diff.push(ExtendedEdgeOp::SrcMissingUpdate(*s,*d,*w)),
-                            (true, false) => extended_diff.push(ExtendedEdgeOp::DstMissingUpdate(*s,*d,*w)),
-                            (true, true) => extended_diff.push(ExtendedEdgeOp::SrcDstPresentUpdate(*s,*d,*w)),
-                        };
-
-                        let current_weight = edge_weight(&graph, *s, *d);
-                        let mut new_weight = current_weight + *w;
-                        if near_zero(new_weight, epsilon) {
-                            new_weight = 0.0;
+                    match (src_present, dst_present) {
+                        (false, false) => {
+                            extended_diff.push(ExtendedEdgeOp::BothMissingUpdate(*s, *d, *w))
                         }
-                        set_edge_weight(&mut graph, *s, *d, new_weight, epsilon);
-                        set_edge_weight(&mut graph, *d, *s, new_weight, epsilon);
-                    },
-                    EdgeOp::DeleteEdge(s,d,x) => {
-                        record_node(*s, &graph);
-                        record_node(*d, &graph);
+                        (false, true) => {
+                            extended_diff.push(ExtendedEdgeOp::SrcMissingUpdate(*s, *d, *w))
+                        }
+                        (true, false) => {
+                            extended_diff.push(ExtendedEdgeOp::DstMissingUpdate(*s, *d, *w))
+                        }
+                        (true, true) => {
+                            extended_diff.push(ExtendedEdgeOp::SrcDstPresentUpdate(*s, *d, *w))
+                        }
+                    };
 
-                        set_edge_weight(&mut graph, *s, *d, 0.0, epsilon);
-                        set_edge_weight(&mut graph, *d, *s, 0.0, epsilon);
-
-                        let src_deleted = near_zero(node_degree(&graph, *s), epsilon);
-                        let dst_deleted = near_zero(node_degree(&graph, *d), epsilon);
-                        
-                        match (src_deleted, dst_deleted){
-                            (false, false) => extended_diff.push(ExtendedEdgeOp::SrcDstPresentDelete(*s,*d,*x)),
-                            (true, false) => {
-                                extended_diff.push(ExtendedEdgeOp::SrcRemoveDelete(*s,*d,*x));
-                            },
-                            (false, true) => {
-                                extended_diff.push(ExtendedEdgeOp::DstRemoveDelete(*s,*d,*x));
-                            },
-                            (true, true) => {
-                                extended_diff.push(ExtendedEdgeOp::BothRemoveDelete(*s,*d,*x));
-                            },
-                        };
+                    let current_weight = edge_weight(&graph, *s, *d);
+                    let mut new_weight = current_weight + *w;
+                    if near_zero(new_weight, epsilon) {
+                        new_weight = 0.0;
                     }
+                    set_edge_weight(&mut graph, *s, *d, new_weight, epsilon);
+                    set_edge_weight(&mut graph, *d, *s, new_weight, epsilon);
+                }
+                EdgeOp::DeleteEdge(s, d, x) => {
+                    record_node(*s, &graph);
+                    record_node(*d, &graph);
+
+                    // Remove only the contribution of this directed edge; keep any opposite-direction weight.
+                    let mut new_weight = edge_weight(&graph, *s, *d) - *x;
+                    if near_zero(new_weight, epsilon) {
+                        new_weight = 0.0;
+                    }
+                    set_edge_weight(&mut graph, *s, *d, new_weight, epsilon);
+                    set_edge_weight(&mut graph, *d, *s, new_weight, epsilon);
+
+                    let src_deleted = near_zero(node_degree(&graph, *s), epsilon);
+                    let dst_deleted = near_zero(node_degree(&graph, *d), epsilon);
+
+                    match (src_deleted, dst_deleted) {
+                        (false, false) => {
+                            extended_diff.push(ExtendedEdgeOp::SrcDstPresentDelete(*s, *d, *x))
+                        }
+                        (true, false) => {
+                            extended_diff.push(ExtendedEdgeOp::SrcRemoveDelete(*s, *d, *x));
+                        }
+                        (false, true) => {
+                            extended_diff.push(ExtendedEdgeOp::DstRemoveDelete(*s, *d, *x));
+                        }
+                        (true, true) => {
+                            extended_diff.push(ExtendedEdgeOp::BothRemoveDelete(*s, *d, *x));
+                        }
+                    };
                 }
             }
-
-            let mut node_ops = NodeOps::default();
-            for node in touched_nodes {
-                let before = *pre_snapshot_degrees.get(&node).unwrap_or(&0.0);
-                let after = node_degree(&graph, node);
-
-                let before_present = !near_zero(before, epsilon);
-                let after_present = !near_zero(after, epsilon);
-
-                if before_present && !after_present {
-                    node_ops.deleted.0.push(node);
-                    node_ops.deleted.1.push(before);
-                } else if !before_present && after_present {
-                    if ever_seen.insert(node) {
-                        node_ops.created_fresh.0.push(node);
-                        node_ops.created_fresh.1.push(after);
-                    } else {
-                        node_ops.created_stale.0.push(node);
-                        node_ops.created_stale.1.push(after);
-                    }
-                } else if before_present && after_present && (before - after).abs() > epsilon {
-                    node_ops.modified.0.push(node);
-                    node_ops.modified.1.push(after);
-                }
-            }
-
-            node_diffs.push(node_ops);
-            extended_diffs.push(extended_diff);
         }
-        (extended_diffs, node_diffs)
+
+        let mut node_ops = NodeOps::default();
+        for node in touched_nodes {
+            let before = *pre_snapshot_degrees.get(&node).unwrap_or(&0.0);
+            let after = node_degree(&graph, node);
+
+            let before_present = !near_zero(before, epsilon);
+            let after_present = !near_zero(after, epsilon);
+
+            if before_present && !after_present {
+                node_ops.deleted.0.push(node);
+                node_ops.deleted.1.push(before);
+            } else if !before_present && after_present {
+                if ever_seen.insert(node) {
+                    node_ops.created_fresh.0.push(node);
+                    node_ops.created_fresh.1.push(after);
+                } else {
+                    node_ops.created_stale.0.push(node);
+                    node_ops.created_stale.1.push(after);
+                }
+            } else if before_present && after_present && (before - after).abs() > epsilon {
+                node_ops.modified.0.push(node);
+                node_ops.modified.1.push(after);
+            }
+        }
+
+        node_diffs.push(node_ops);
+        extended_diffs.push(extended_diff);
+    }
+    (extended_diffs, node_diffs)
 }
-
-
 
 #[derive(PartialEq, PartialOrd, Debug, Copy, Clone)]
-enum TemporalOp{
+enum TemporalOp {
     Update(i64, f64), // update to this amount (time, delta)
-    Delete(i64, f64) // Clear the contribution of this edge (time, edge_weight)
+    Delete(i64, f64), // Clear the contribution of this edge (time, edge_weight)
 }
-
-
-
 
 /// For holding update diffs to be applied to an external data structure
 /// Applying `snapshot_diffs[0]` to an external data structure
@@ -258,38 +264,40 @@ enum TemporalOp{
 /// Applying `snapshot_diffs[i]` given the state at `snapshot_times[i-1]`
 /// moves you to the state at `snapshot_times[i]`.
 #[derive(Debug)]
-pub struct SnapshotDiffs<V>{
+pub struct SnapshotDiffs<V> {
     pub snapshot_times: Vec<i64>,
     pub snapshot_diffs: Vec<Vec<ExtendedEdgeOp<V>>>,
-    pub node_diffs: Vec<NodeOps<V>>
+    pub node_diffs: Vec<NodeOps<V>>,
 }
 
-impl<V> SnapshotDiffs<V>{
-    pub fn iter_edge_diffs(&self) -> impl Iterator<Item = (&i64, &Vec<ExtendedEdgeOp<V>>)>{
+impl<V> SnapshotDiffs<V> {
+    pub fn iter_edge_diffs(&self) -> impl Iterator<Item = (&i64, &Vec<ExtendedEdgeOp<V>>)> {
         self.snapshot_times.iter().zip(self.snapshot_diffs.iter())
     }
-    pub fn iter_node_diffs(&self) -> impl Iterator<Item = (&i64, &NodeOps<V>)>{
+    pub fn iter_node_diffs(&self) -> impl Iterator<Item = (&i64, &NodeOps<V>)> {
         self.snapshot_times.iter().zip(self.node_diffs.iter())
     }
 }
 
-
-
-
 /// For a single edge, return a list of (start, stop, value) intervals for `prop`.
 /// `stop` is exclusive.
-fn build_timeline(edge: EdgeView<&PersistentGraph>,prop: &str) -> Vec<(i64,i64, f64)>{
-    edge.explode().into_iter()
-    .filter(|x| x.properties().get(prop).is_some())
-    .map(|e|{
-        (
-            e.earliest_time().unwrap(),
-            e.latest_time().unwrap(),
-            e.properties().get(prop).unwrap().as_f64().unwrap()
-        )
-    }).collect()
-}
+fn build_timeline(edge: EdgeView<&PersistentGraph>, prop: &str) -> Vec<(i64, i64, f64)> {
+    let mut timeline = edge
+        .explode()
+        .into_iter()
+        .filter(|x| x.properties().get(prop).is_some())
+        .map(|e| {
+            (
+                e.earliest_time().unwrap(),
+                e.latest_time().unwrap(), // end is exclusive for snapshots
+                e.properties().get(prop).unwrap().as_f64().unwrap(),
+            )
+        })
+        .collect::<Vec<_>>();
 
+    timeline.sort_by_key(|(start, _, _)| *start);
+    timeline
+}
 
 /// Given an edge timeline and a list of snapshot times, return, for each snapshot,
 /// a list of `TemporalOp` describing the **delta** needed to move from the previous
@@ -325,21 +333,19 @@ fn snapshot_ops_for_timeline(
         }
 
         // Determine current value at snap_t.
-        let cur_val = if idx < timeline.len()
-            && snap_t >= timeline[idx].0
-            && snap_t < timeline[idx].1
-        {
-            timeline[idx].2
-        } else {
-            0.0
-        };
+        let cur_val =
+            if idx < timeline.len() && snap_t >= timeline[idx].0 && snap_t < timeline[idx].1 {
+                timeline[idx].2
+            } else {
+                0.0
+            };
 
         let mut ops = Vec::new();
         if cur_val == prev_val {
             // No change.
         } else if cur_val == 0.0 {
             // Transition from >0 to 0.
-            // We delete 
+            // We delete
             ops.push(TemporalOp::Delete(snap_t, prev_val));
         } else {
             // Non-zero value: emit delta.
@@ -354,7 +360,6 @@ fn snapshot_ops_for_timeline(
     result
 }
 
-
 /// Build snapshot diffs for the entire graph.
 ///
 /// `start` and `end` define the time range; `step_size` is the spacing between snapshots.
@@ -362,69 +367,100 @@ fn snapshot_ops_for_timeline(
 ///   snapshot_times = [start, start + step_size, start + 2*step_size, ... , < end]
 ///
 /// `prop_name` is the edge property used as the weight.
-pub fn build_snapshot_diffs(graph: &PersistentGraph, start:i64, end: i64, step_size: usize, prop_name:&str, epsilon: f64) -> Result<SnapshotDiffs<VID>>{
-
+pub fn build_snapshot_diffs(
+    graph: &PersistentGraph,
+    start: i64,
+    end: i64,
+    step_size: usize,
+    prop_name: &str,
+    epsilon: f64,
+) -> Result<SnapshotDiffs<VID>> {
     let graph_start = graph.earliest_time();
     let graph_end = graph.latest_time();
 
-
-
-    if graph_start.is_none()|| graph_end.is_none(){
-        return Err(anyhow!(
-            "No edges in the graph!"
-        ));
+    if graph_start.is_none() || graph_end.is_none() {
+        return Err(anyhow!("No edges in the graph!"));
     }
     let graph_start = graph_start.unwrap();
     let graph_end = graph_end.unwrap();
-    if graph_start == graph_end{
+    if graph_start == graph_end {
         return Err(anyhow!(
             "Snapshots don't make sense for a graph whose edges only live during the instant at {graph_start}"
-        ))
+        ));
     }
-    if start<graph_start || end > graph_end{
+    if start < graph_start || end > graph_end {
         return Err(anyhow!(
             "Snapshot range [{start}, {end}) is outside the graph range [{graph_start}, {graph_end})"
         ));
     }
 
-    if step_size == 0{
-        return Err(anyhow!(
-            "step_size must be greater than zero"
-        ))
+    if step_size == 0 {
+        return Err(anyhow!("step_size must be greater than zero"));
     }
 
     let snapshot_times = (start..end).step_by(step_size).collect::<Vec<_>>();
 
     // for the final reduce when we merge edge snapshot diffs.
-    let identity = || snapshot_times.iter().map(|_| Vec::new()).collect::<Vec<Vec<EdgeOp<VID>>>>();
+    let identity = || {
+        snapshot_times
+            .iter()
+            .map(|_| Vec::new())
+            .collect::<Vec<Vec<EdgeOp<VID>>>>()
+    };
 
-    // For each edge, compute per-snapshot temporal ops, then convert them to EdgeOp
-    // (delta updates / deletes), then merge the edge snapshots together.
-    let edge_snapshot_diffs = graph.edges().iter().par_bridge().map(|edge|{
-        let src = edge.edge.src();
-        let dst = edge.edge.dst();
-        let timeline = build_timeline(edge, prop_name);
-        snapshot_ops_for_timeline(&timeline, &snapshot_times).into_iter().map(|buckets|{
-            buckets.into_iter().map(|action|{
-                match action{
-                    TemporalOp::Update(_,x ) => EdgeOp::Update(src, dst, x),
-                    TemporalOp::Delete(_,x) => EdgeOp::DeleteEdge(src, dst,x)
+    // Build per-edge timelines once and reduce them into snapshot diffs.
+    let edge_snapshot_diffs = graph
+        .edges()
+        .iter()
+        .par_bridge()
+        .filter_map(|edge| {
+            let src: VID = edge.edge.src();
+            let dst: VID = edge.edge.dst();
+
+            // Process each undirected pair once.
+            if src > dst {
+                return None;
+            }
+
+            let timeline = build_timeline(edge, prop_name);
+            if timeline.is_empty() {
+                return None;
+            }
+
+            let per_snapshot = snapshot_ops_for_timeline(&timeline, &snapshot_times);
+            Some(
+                per_snapshot
+                    .into_iter()
+                    .map(|ops_for_snapshot| {
+                        ops_for_snapshot
+                            .into_iter()
+                            .map(|op| match op {
+                                TemporalOp::Update(_, delta) => EdgeOp::Update(src, dst, delta),
+                                TemporalOp::Delete(_, x) => EdgeOp::DeleteEdge(src, dst, x),
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .reduce(
+            || identity(),
+            |mut acc, edge_contrib| {
+                for (acc_slot, edge_slot) in acc.iter_mut().zip(edge_contrib.into_iter()) {
+                    acc_slot.extend(edge_slot);
                 }
-            }).collect::<Vec<_>>()
-        }).collect::<Vec<_>>()
-    }).reduce(identity , |mut acc: Vec<Vec<EdgeOp<VID>>>,b: Vec<Vec<EdgeOp<VID>>>|{
-        for (x,y) in acc.iter_mut().zip(b){
-            x.extend(y);
-        }
-        acc
-    });
+                acc
+            },
+        );
 
     let (snapshot_diffs, node_diffs) = extend_diffs(&edge_snapshot_diffs, epsilon);
 
-    Ok(SnapshotDiffs { snapshot_times, snapshot_diffs, node_diffs })
+    Ok(SnapshotDiffs {
+        snapshot_times,
+        snapshot_diffs,
+        node_diffs,
+    })
 }
-
-
 
 //MARK: Tests
 
@@ -433,10 +469,10 @@ pub fn build_snapshot_diffs(graph: &PersistentGraph, start:i64, end: i64, step_s
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
-    use raphtory::db::graph::views::deletion_graph::PersistentGraph;
     use rand::rngs::StdRng;
     use rand::{Rng, SeedableRng};
+    use raphtory::db::graph::views::deletion_graph::PersistentGraph;
+    use std::collections::HashMap;
 
     const EPS: f64 = 1e-9;
 
@@ -496,23 +532,22 @@ mod tests {
             _ => panic!("Expected BothRemoveDelete when the only edge is deleted"),
         }
 
-        let node_ops_to_map =
-            |ops: &NodeOps<VID>| -> HashMap<VID, (&str, f64)> {
-                let mut out = HashMap::new();
-                for (v, deg) in ops.created_fresh.0.iter().zip(ops.created_fresh.1.iter()) {
-                    out.insert(*v, ("created_fresh", *deg));
-                }
-                for (v, deg) in ops.created_stale.0.iter().zip(ops.created_stale.1.iter()) {
-                    out.insert(*v, ("created_stale", *deg));
-                }
-                for (v, deg) in ops.modified.0.iter().zip(ops.modified.1.iter()) {
-                    out.insert(*v, ("modified", *deg));
-                }
-                for (v, deg) in ops.deleted.0.iter().zip(ops.deleted.1.iter()) {
-                    out.insert(*v, ("deleted", *deg));
-                }
-                out
-            };
+        let node_ops_to_map = |ops: &NodeOps<VID>| -> HashMap<VID, (&str, f64)> {
+            let mut out = HashMap::new();
+            for (v, deg) in ops.created_fresh.0.iter().zip(ops.created_fresh.1.iter()) {
+                out.insert(*v, ("created_fresh", *deg));
+            }
+            for (v, deg) in ops.created_stale.0.iter().zip(ops.created_stale.1.iter()) {
+                out.insert(*v, ("created_stale", *deg));
+            }
+            for (v, deg) in ops.modified.0.iter().zip(ops.modified.1.iter()) {
+                out.insert(*v, ("modified", *deg));
+            }
+            for (v, deg) in ops.deleted.0.iter().zip(ops.deleted.1.iter()) {
+                out.insert(*v, ("deleted", *deg));
+            }
+            out
+        };
 
         let created0 = node_ops_to_map(&node_diffs[0]);
         assert!(matches!(created0.get(&v1), Some(("created_fresh", deg)) if approx_eq(*deg,1.0)));
@@ -588,7 +623,7 @@ mod tests {
 
         assert_eq!(per_snapshot[1].len(), 1);
         match per_snapshot[1][0] {
-            TemporalOp::Delete(_,x) => {}
+            TemporalOp::Delete(_, x) => {}
             _ => panic!("Expected Delete at second snapshot"),
         }
 
@@ -609,48 +644,44 @@ mod tests {
             .unwrap_or(0.0);
 
         graph
-            .add_edge(
-                t,
-                &src,
-                &dst,
-                [("w", Prop::F64(old_edge_weight + w))],
-                None,
-            )
+            .add_edge(t, &src, &dst, [("w", Prop::F64(old_edge_weight + w))], None)
+            .unwrap();
+        graph
+            .add_edge(t, &dst, &src, [("w", Prop::F64(old_edge_weight + w))], None)
             .unwrap();
     }
 
-    fn apply_snapshot_ops<V: Copy+Eq+std::hash::Hash>(
+    fn canonical_pair<V: Ord + Copy>(a: V, b: V) -> (V, V) {
+        if a <= b { (a, b) } else { (b, a) }
+    }
+
+    fn apply_snapshot_ops<V: Copy + Eq + std::hash::Hash + Ord>(
         state: &mut HashMap<(V, V), f64>,
         ops: &[ExtendedEdgeOp<V>],
     ) {
         for op in ops {
             match op.edge_op() {
                 EdgeOp::Update(u, v, delta) => {
-                    *state.entry((u, v)).or_insert(0.0) += delta;
+                    let key = canonical_pair(u, v);
+                    *state.entry(key).or_insert(0.0) += delta;
                 }
                 EdgeOp::DeleteEdge(u, v, x) => {
-                    state.remove(&(u, v));
+                    let key = canonical_pair(u, v);
+                    state.remove(&key);
                 }
             }
         }
     }
 
-    fn snapshot_weights(
-        graph: &PersistentGraph,
-        t: i64,
-    ) -> HashMap<(VID, VID), f64> {
+    fn snapshot_weights(graph: &PersistentGraph, t: i64) -> HashMap<(VID, VID), f64> {
         let mut out = HashMap::new();
         let view = graph.at(t);
         for e in view.edges().iter() {
-            let w = e
-                .properties()
-                .get("w")
-                .unwrap()
-                .as_f64()
-                .unwrap();
+            let w = e.properties().get("w").unwrap().as_f64().unwrap();
             let src: VID = e.edge.src();
             let dst: VID = e.edge.dst();
-            out.insert((src, dst), w);
+            let key = canonical_pair(src, dst);
+            out.insert(key, w);
         }
         out
     }
@@ -661,10 +692,45 @@ mod tests {
         for (idx, t) in diffs.snapshot_times.iter().enumerate() {
             apply_snapshot_ops(&mut external_state, &diffs.snapshot_diffs[idx]);
             let expected = snapshot_weights(graph, *t);
-            assert_eq!(
-                external_state, expected,
-                "Mismatch at snapshot time {t}"
-            );
+            if external_state != expected {
+                let extra: Vec<_> = external_state
+                    .iter()
+                    .filter(|(k, v)| expected.get(k) != Some(*v))
+                    .collect();
+                let missing: Vec<_> = expected
+                    .iter()
+                    .filter(|(k, v)| external_state.get(k) != Some(*v))
+                    .collect();
+                if let Some((k, v)) = missing.first() {
+                    let canon = *k;
+                    let seen_in_ops: usize = diffs.snapshot_diffs[..=idx]
+                        .iter()
+                        .flat_map(|ops| ops.iter())
+                        .filter(|op| {
+                            let (u, v) = match op.edge_op() {
+                                EdgeOp::Update(u, v, _) | EdgeOp::DeleteEdge(u, v, _) => {
+                                    canonical_pair(u, v)
+                                }
+                            };
+                            (u, v) == *canon
+                        })
+                        .count();
+                    panic!(
+                        "Mismatch at snapshot time {t}; extra: {}, missing: {} (first missing: {:?} -> {}, occurrences in diffs <= idx: {})",
+                        extra.len(),
+                        missing.len(),
+                        k,
+                        v,
+                        seen_in_ops
+                    );
+                } else {
+                    panic!(
+                        "Mismatch at snapshot time {t}; extra: {}, missing: {}",
+                        extra.len(),
+                        missing.len()
+                    );
+                }
+            }
         }
     }
 
@@ -677,13 +743,10 @@ mod tests {
         let graph_start = graph.earliest_time().unwrap();
         let graph_end = graph.latest_time().unwrap();
         let diffs =
-            build_snapshot_diffs(graph, graph_start, graph_end, step_size, prop, epsilon)
-                .unwrap();
+            build_snapshot_diffs(graph, graph_start, graph_end, step_size, prop, epsilon).unwrap();
         assert!(!diffs.snapshot_times.is_empty());
         assert_diffs_match_graph(graph, &diffs);
     }
-
-
 
     // ============================================================
     // 1. Integration / behaviour tests
@@ -724,7 +787,12 @@ mod tests {
         let graph = PersistentGraph::new();
 
         add_weight(&graph, 0, "u", "v", 3.0);
-        graph.add_edge(5, "u", "v", [("w", Prop::F64(0.0))], None).unwrap();
+        graph
+            .add_edge(5, "u", "v", [("w", Prop::F64(0.0))], None)
+            .unwrap();
+        graph
+            .add_edge(5, "v", "u", [("w", Prop::F64(0.0))], None)
+            .unwrap();
 
         assert_full_range_diffs_match_graph(&graph, 3, "w", EPS);
     }
@@ -772,7 +840,8 @@ mod tests {
             if rng.random_bool(0.6) {
                 add_weight(&graph, t, src, dst, 1.0);
             } else {
-                graph.delete_edge(t, src, dst, None).unwrap();
+                let _ = graph.delete_edge(t, src, dst, None);
+                let _ = graph.delete_edge(t, dst, src, None);
             }
         }
 
@@ -806,7 +875,7 @@ mod tests {
 
         assert_eq!(per_snapshot[2].len(), 1);
         match per_snapshot[2][0] {
-            TemporalOp::Delete(_,_) => {}
+            TemporalOp::Delete(_, _) => {}
             _ => panic!("Expected Delete at snapshot 2"),
         }
 
@@ -851,7 +920,7 @@ mod tests {
                     .into_iter()
                     .map(|op| match op {
                         TemporalOp::Update(_, delta) => EdgeOp::Update(VID(1), VID(2), delta),
-                        TemporalOp::Delete(_,x) => EdgeOp::DeleteEdge(VID(1), VID(2),x),
+                        TemporalOp::Delete(_, x) => EdgeOp::DeleteEdge(VID(1), VID(2), x),
                     })
                     .collect()
             })
@@ -864,20 +933,21 @@ mod tests {
                     .into_iter()
                     .map(|op| match op {
                         TemporalOp::Update(_, delta) => EdgeOp::Update(VID(3), VID(4), delta),
-                        TemporalOp::Delete(_,x) => EdgeOp::DeleteEdge(VID(3), VID(4),x),
+                        TemporalOp::Delete(_, x) => EdgeOp::DeleteEdge(VID(3), VID(4), x),
                     })
                     .collect()
             })
             .collect();
 
-        let aggregated = [per_edge_a, per_edge_b]
-            .into_iter()
-            .fold(identity(), |mut acc, edge_contrib| {
-                for (acc_slot, edge_slot) in acc.iter_mut().zip(edge_contrib) {
-                    acc_slot.extend(edge_slot);
-                }
-                acc
-            });
+        let aggregated =
+            [per_edge_a, per_edge_b]
+                .into_iter()
+                .fold(identity(), |mut acc, edge_contrib| {
+                    for (acc_slot, edge_slot) in acc.iter_mut().zip(edge_contrib) {
+                        acc_slot.extend(edge_slot);
+                    }
+                    acc
+                });
 
         assert_eq!(aggregated[0].len(), 2);
         let mut map0: HashMap<(VID, VID), f64> = HashMap::new();
@@ -913,7 +983,7 @@ mod tests {
                     .into_iter()
                     .map(|op| match op {
                         TemporalOp::Update(_, delta) => EdgeOp::Update(VID(1), VID(2), delta),
-                        TemporalOp::Delete(_,x) => EdgeOp::DeleteEdge(VID(1), VID(2),x),
+                        TemporalOp::Delete(_, x) => EdgeOp::DeleteEdge(VID(1), VID(2), x),
                     })
                     .collect()
             })
@@ -926,23 +996,29 @@ mod tests {
                     .into_iter()
                     .map(|op| match op {
                         TemporalOp::Update(_, delta) => EdgeOp::Update(VID(3), VID(4), delta),
-                        TemporalOp::Delete(_,x) => EdgeOp::DeleteEdge(VID(3), VID(4),x),
+                        TemporalOp::Delete(_, x) => EdgeOp::DeleteEdge(VID(3), VID(4), x),
                     })
                     .collect()
             })
             .collect();
 
-        let identity =
-            || vec![Vec::<EdgeOp<VID>>::new(), Vec::<EdgeOp<VID>>::new(), Vec::<EdgeOp<VID>>::new()];
+        let identity = || {
+            vec![
+                Vec::<EdgeOp<VID>>::new(),
+                Vec::<EdgeOp<VID>>::new(),
+                Vec::<EdgeOp<VID>>::new(),
+            ]
+        };
 
-        let aggregated = [per_edge_a, per_edge_b]
-            .into_iter()
-            .fold(identity(), |mut acc, edge_contrib| {
-                for (acc_slot, edge_slot) in acc.iter_mut().zip(edge_contrib) {
-                    acc_slot.extend(edge_slot);
-                }
-                acc
-            });
+        let aggregated =
+            [per_edge_a, per_edge_b]
+                .into_iter()
+                .fold(identity(), |mut acc, edge_contrib| {
+                    for (acc_slot, edge_slot) in acc.iter_mut().zip(edge_contrib) {
+                        acc_slot.extend(edge_slot);
+                    }
+                    acc
+                });
 
         let mut map0: HashMap<(VID, VID), f64> = HashMap::new();
         for op in &aggregated[0] {
@@ -950,7 +1026,7 @@ mod tests {
                 EdgeOp::Update(u, v, delta) => {
                     *map0.entry((u, v)).or_insert(0.0) += delta;
                 }
-                EdgeOp::DeleteEdge(_, _,_) => panic!("No deletes expected at snapshot 0"),
+                EdgeOp::DeleteEdge(_, _, _) => panic!("No deletes expected at snapshot 0"),
             }
         }
         assert!(approx_eq(*map0.get(&(VID(1), VID(2))).unwrap(), 1.0));
@@ -961,7 +1037,7 @@ mod tests {
         for op in &aggregated[1] {
             match *op {
                 EdgeOp::Update(u, v, delta) if (u, v) == (VID(1), VID(2)) => a_delta += delta,
-                EdgeOp::DeleteEdge(u, v,_) if (u, v) == (VID(3), VID(4)) => b_deleted = true,
+                EdgeOp::DeleteEdge(u, v, _) if (u, v) == (VID(3), VID(4)) => b_deleted = true,
                 _ => {}
             }
         }
@@ -972,7 +1048,7 @@ mod tests {
         let mut b_anything = false;
         for op in &aggregated[2] {
             match *op {
-                EdgeOp::DeleteEdge(u, v,_) if (u, v) == (VID(1), VID(2)) => a_deleted_again = true,
+                EdgeOp::DeleteEdge(u, v, _) if (u, v) == (VID(1), VID(2)) => a_deleted_again = true,
                 EdgeOp::Update(_, _, _) => b_anything = true,
                 _ => {}
             }
