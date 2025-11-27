@@ -104,7 +104,9 @@ impl<V: std::hash::Hash + Eq + Clone + Copy> SamplingInfo<V> {
     }
 }
 
-impl<const ARITY: usize, V: std::hash::Hash + Eq + Clone + Copy + Send + Sync> DynamicClustering<ARITY, V> {
+impl<const ARITY: usize, V: std::hash::Hash + Eq + Clone + Copy + Send + Sync>
+    DynamicClustering<ARITY, V>
+{
     pub fn extract_coreset(
         &mut self,
         graph: &impl GraphLike<V = V>,
@@ -408,8 +410,7 @@ impl<const ARITY: usize, V: std::hash::Hash + Eq + Clone + Copy + Send + Sync> D
         coreset: &Coreset<V>,
         time: i64,
         graph: &(impl GraphLike<V = V> + Sync),
-    ) -> SparseRowMat<usize, Float> 
-    {
+    ) -> SparseRowMat<usize, f64> {
         let n = coreset.node_indices.len();
         let shift = self.sigma;
 
@@ -432,16 +433,18 @@ impl<const ARITY: usize, V: std::hash::Hash + Eq + Clone + Copy + Send + Sync> D
             .collect::<Vec<Float>>();
 
         // guess the number of non-zero entries in the coreset graph:
-        let mut data = Vec::<Float>::with_capacity(n * 200);
+        let mut data = Vec::<f64>::with_capacity(n * 200);
         let mut indices = Vec::<usize>::with_capacity(n * 200);
         let mut indptr = Vec::<usize>::with_capacity(n + 1);
         let mut nnz_per_row = Vec::<usize>::with_capacity(n);
 
         let mut indptr_counter = 0;
 
-        let neighbour_list = coreset_indices.as_slice().par_iter().map(|v|{
-            graph.neighbours(v, time).collect::<Vec<_>>()
-        }).collect::<Vec<_>>();
+        let neighbour_list = coreset_indices
+            .as_slice()
+            .par_iter()
+            .map(|v| graph.neighbours(v, time).collect::<Vec<_>>())
+            .collect::<Vec<_>>();
 
         for (i, &node_name) in coreset_indices.iter().enumerate() {
             let neighbours = neighbour_list[i].iter();
@@ -487,7 +490,7 @@ impl<const ARITY: usize, V: std::hash::Hash + Eq + Clone + Copy + Send + Sync> D
             good_indices_and_data_transformed.sort_unstable_by_key(|&(idx, _)| idx);
 
             // push the data and indices to the data and indices vectors:
-            data.extend(good_indices_and_data_transformed.iter().map(|x| x.1));
+            data.extend(good_indices_and_data_transformed.iter().map(|x| x.1.0));
             indices.extend(good_indices_and_data_transformed.iter().map(|x| x.0));
             let nnz = good_indices_and_data_transformed.len();
             nnz_per_row.push(nnz);

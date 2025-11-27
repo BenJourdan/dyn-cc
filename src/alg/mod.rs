@@ -7,9 +7,9 @@ use crate::{
     diff::ExtendedEdgeOp,
     snapshot_clustering::{GraphLike, PartitionOutput, PartitionType, SnapshotClusteringAlg},
 };
-use faer::sparse::SparseRowMat;
+use faer::{sparse::SparseRowMat, traits::num_traits::Zero};
 use rayon::prelude::*;
-use std::{fmt::Debug, hash::Hash};
+use std::{fmt::Debug, hash::Hash, num::NonZero, sync::Arc};
 
 use crate::alg::common::reinterpret_slice;
 use crate::diff::{EdgeOp, NodeOps};
@@ -17,6 +17,16 @@ use crate::diff::{EdgeOp, NodeOps};
 use common::*;
 use priority_queue::PriorityQueue;
 use rustc_hash::{FxHashMap, FxHashSet};
+
+use dyn_stack::{MemBuffer, MemStack};
+use faer::{
+    Par,
+    col::Col,
+    mat::Mat,
+    matrix_free::eigen::{PartialEigenParams, partial_eigen, partial_eigen_scratch},
+};
+use num_complex::Complex;
+use rand::{Rng, SeedableRng, rngs::StdRng};
 
 #[derive(Default, Debug)]
 pub struct TreeData<const ARITY: usize> {
@@ -53,7 +63,8 @@ pub struct DynamicClustering<const ARITY: usize, V> {
     pub sampling_seeds: usize,
 
     pub num_clusters: usize,
-    pub cluster_alg: fn(&SparseRowMat<usize, Float>, usize) -> Vec<usize>,
+    pub cluster_alg:
+        Arc<dyn Fn(&SparseRowMat<usize, f64>, usize) -> Vec<usize> + Send + Sync + 'static>,
 }
 
 impl<const ARITY: usize, V: std::hash::Hash + Eq + Clone + Copy> DynamicClustering<ARITY, V> {
@@ -62,7 +73,7 @@ impl<const ARITY: usize, V: std::hash::Hash + Eq + Clone + Copy> DynamicClusteri
         coreset_size: usize,
         sampling_seeds: usize,
         num_clusters: usize,
-        cluster_alg: fn(&SparseRowMat<usize, Float>, usize) -> Vec<usize>,
+        cluster_alg: fn(&SparseRowMat<usize, f64>, usize) -> Vec<usize>,
     ) -> Self {
         Self {
             node_to_tree_map: Default::default(),
@@ -75,13 +86,13 @@ impl<const ARITY: usize, V: std::hash::Hash + Eq + Clone + Copy> DynamicClusteri
             coreset_size,
             sampling_seeds,
             num_clusters,
-            cluster_alg,
+            cluster_alg: Arc::new(cluster_alg),
         }
     }
 }
 
-impl<const ARITY: usize, V: std::hash::Hash + Eq + Clone + Copy + Send + Sync> SnapshotClusteringAlg<V>
-    for DynamicClustering<ARITY, V>
+impl<const ARITY: usize, V: std::hash::Hash + Eq + Clone + Copy + Send + Sync>
+    SnapshotClusteringAlg<V> for DynamicClustering<ARITY, V>
 {
     fn apply_edge_ops(&mut self, time: i64, ops: &[ExtendedEdgeOp<V>], graph: &impl GraphLike) {}
 
@@ -146,19 +157,42 @@ impl<const ARITY: usize, V: std::hash::Hash + Eq + Clone + Copy + Send + Sync> S
     }
 }
 
-pub fn cluster(graph: &SparseRowMat<usize, Float>, k: usize) -> Vec<usize> {
-    // Simple spectral-ish clustering:
-    // - Build dense adjacency from CSR.
-    // - Normalize rows by sqrt degree to get features.
-    // - Run a basic k-means on those features.
+pub fn cluster(graph: &SparseRowMat<usize, f64>, k: usize) -> Vec<usize> {
+    let n = graph.ncols();
+    if n == 0 || k == 0 {
+        return Vec::new();
+    }
 
-    // let n = graph.ncols();
+    // Random initial vector v0, normalised.
+    let mut rng = StdRng::seed_from_u64(42);
+    let mut v0 = Col::from_fn(n, |_| rng.random_range(-1.0..1.0));
+    let norm = v0.as_ref().norm_l2();
+    if norm > 0.0 {
+        for v in v0.as_mut().iter_mut() {
+            *v /= norm;
+        }
+    }
 
-    // let ones = Mat::ones(n,1);
+    let params = PartialEigenParams::default();
+    let par = Par::Rayon(NonZero::new(16).unwrap());
+    let scratch = partial_eigen_scratch(graph, k, par, params);
+    let mut stack_buf = MemBuffer::new(scratch);
+    let mut stack = MemStack::new(&mut stack_buf);
 
-    // let D = graph * ones;
+    let mut eigvecs = Mat::zeros(n, k);
+    let mut eigvals = vec![Complex::new(0.0, 0.0); k];
 
-    // todo!()
+    let _info = partial_eigen(
+        eigvecs.as_mut(),
+        eigvals.as_mut_slice(),
+        graph,
+        v0.as_ref(),
+        f64::EPSILON * 128.0,
+        par,
+        &mut stack,
+        params,
+    );
 
-    vec![1, 2, 3, 4, 5]
+    // Placeholder clustering: assign all nodes to cluster 0.
+    vec![eigvals[0].re as usize; n]
 }

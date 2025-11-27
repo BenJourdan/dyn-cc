@@ -13,9 +13,11 @@ debug = true
 
 [dependencies]
 anyhow = "1.0.100"
+dyn-stack = "0.13.2"
 faer = "0.23.2"
 indicatif = "0.18.2"
 itertools = "0.14.0"
+num-complex = "0.4.6"
 
 ordered-float = "5.1.0"
 priority-queue = "2.7.0"

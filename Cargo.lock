@@ -411,9 +411,11 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "criterion",
+ "dyn-stack",
  "faer",
  "indicatif",
  "itertools 0.14.0",
+ "num-complex",
  "ordered-float 5.1.0",
  "priority-queue",
  "rand 0.9.2",
