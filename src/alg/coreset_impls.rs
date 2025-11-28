@@ -28,6 +28,7 @@ pub struct Coreset<V> {
     pub nodes: Vec<V>,
     pub node_indices: Vec<TreeIndex>,
     pub weights: Vec<Float>,
+    pub coreset_labels: Option<Vec<usize>>,
 }
 
 // Holds info for coreset construction.
@@ -223,6 +224,7 @@ impl<const ARITY: usize, V: std::hash::Hash + Eq + Clone + Copy + Send + Sync>
             nodes: unique_vs,
             node_indices: unique_indices,
             weights,
+            coreset_labels: None,
         })
     }
 
@@ -504,5 +506,210 @@ impl<const ARITY: usize, V: std::hash::Hash + Eq + Clone + Copy + Send + Sync>
             SymbolicSparseRowMat::<usize>::new_checked(n, n, indptr, Some(nnz_per_row), indices),
             data,
         )
+    }
+
+    pub fn rust_label_full_graph(
+        &self,
+        coreset: &Coreset<V>,
+        num_clusters: usize,
+        time: i64,
+        graph: &(impl GraphLike<V = V> + Sync),
+        nodes: Option<&[V]>,
+    ) -> (Vec<V>, Vec<usize>, Vec<Float_Dtype>) {
+        let shift = self.sigma;
+        let coreset_names = coreset.nodes.clone();
+        let coreset_weights = reinterpret_slice::<Float, f64>(coreset.weights.as_slice()).to_vec();
+        let coreset_labels = coreset
+            .coreset_labels
+            .as_ref()
+            .expect("coreset labels must be set before full-graph labelling");
+
+        let node_names = match nodes {
+            Some(subset) => subset.to_vec(),
+            None => graph.nodes(time),
+        };
+
+        // Union of all nodes we will touch (labelled nodes + coreset) to deduplicate neighbour lookups.
+        let mut all_nodes_set: FxHashSet<V> = node_names.iter().copied().collect();
+        all_nodes_set.extend(coreset_names.iter().copied());
+        let all_nodes: Vec<V> = all_nodes_set.iter().copied().collect();
+
+        // Precompute degree lookups to avoid touching the priority queue in parallel.
+        let degree_map: FxHashMap<V, Float> = all_nodes
+            .iter()
+            .map(|v| (*v, self.degrees.get(v).unwrap().1.0))
+            .collect();
+
+        // Precompute neighbourhoods for all nodes we will inspect (coreset + label targets).
+
+        // Slowest part by far:
+        // let t0 = std::time::Instant::now();
+        let adjacency_vec = all_nodes
+            .par_iter()
+            .map(|node| (*node, graph.neighbours(node, time).collect::<Vec<_>>()))
+            .collect::<Vec<_>>();
+        let adjacency: FxHashMap<_, _> = adjacency_vec.into_iter().collect();
+        // println!("Took {} ms", t0.elapsed().as_millis());
+
+        // Group the coreset nodes/weights by cluster label.
+        let coreset_grouped = coreset_names
+            .iter()
+            .zip(coreset_labels.iter())
+            .zip(coreset_weights.iter())
+            .fold(
+                vec![(Vec::new(), Vec::new()); num_clusters],
+                |mut acc, ((&name, &label), &weight)| {
+                    acc[label].0.push(name);
+                    acc[label].1.push(weight);
+                    acc
+                },
+            );
+
+        // Compute center norms and denominators per cluster (parallel per center).
+        let result = coreset_grouped
+            .into_par_iter()
+            .map(|(indices, weights)| {
+                if indices.is_empty() {
+                    // Empty cluster: give it an infinite norm so it is never chosen as the default.
+                    return (Float::from(f64::INFINITY), Float::from(0.0));
+                }
+
+                let indices_set: FxHashSet<V> = indices.iter().copied().collect();
+                let index_to_weight: FxHashMap<V, Float_Dtype> = indices
+                    .iter()
+                    .copied()
+                    .zip(weights.iter().copied())
+                    .collect();
+
+                let denom = Float::from(weights.iter().sum::<Float_Dtype>());
+                // Defensive: avoid zero denom
+                if denom == Float::from(0.0) {
+                    return (Float::from(f64::INFINITY), Float::from(0.0));
+                }
+                let mut center_norm_sum = Float::from(0.0);
+
+                indices.iter().for_each(|i| {
+                    let weight = index_to_weight[i];
+                    let vertex_degree =
+                        *degree_map.get(i).expect("degree missing for coreset node");
+                    let neighbours = adjacency.get(i).map(|x| x.as_slice()).unwrap_or(&[]);
+
+                    let neighbour_contrib =
+                        neighbours.iter().fold(Float::from(0.0), |acc, (j, v)| {
+                            if indices_set.contains(j) {
+                                let neighbour_degree =
+                                    *degree_map.get(j).expect("degree missing for neighbour");
+                                let value = if i != j {
+                                    Float::from(*v) / (vertex_degree * neighbour_degree)
+                                } else {
+                                    Float::from(*v) / (vertex_degree * neighbour_degree)
+                                        + shift / vertex_degree
+                                };
+                                acc + value * Float::from(weight) * Float::from(index_to_weight[j])
+                            } else {
+                                acc
+                            }
+                        });
+
+                    center_norm_sum += neighbour_contrib;
+                });
+
+                center_norm_sum /= denom * denom;
+                (center_norm_sum, denom)
+            })
+            .collect::<Vec<(Float, Float)>>();
+
+        let (center_norms, center_denoms): (Vec<Float>, Vec<Float>) = result.into_iter().unzip();
+
+        // Pick the smallest finite center norm; if none are finite, fall back to cluster 0.
+        let mut smallest_center_by_norm = 0usize;
+        let mut smallest_center_by_norm_value = Float::from(f64::INFINITY);
+        for (idx, norm) in center_norms.iter().enumerate() {
+            if norm.is_finite() && *norm < smallest_center_by_norm_value {
+                smallest_center_by_norm = idx;
+                smallest_center_by_norm_value = *norm;
+            }
+        }
+
+        let coreset_set: FxHashSet<V> = coreset_names.iter().copied().collect();
+        let label_map: FxHashMap<V, usize> = coreset_names
+            .iter()
+            .copied()
+            .zip(coreset_labels.iter().copied())
+            .collect();
+        let weight_map: FxHashMap<V, Float_Dtype> = coreset_names
+            .iter()
+            .copied()
+            .zip(coreset_weights.iter().copied())
+            .collect();
+
+        let labels_and_distances: (Vec<usize>, Vec<Float_Dtype>) = node_names
+            .par_iter()
+            .map(|i| {
+                let vertex_degree = *degree_map
+                    .get(i)
+                    .expect("degree missing for node in labelling pass");
+                let mut x_to_c_is: FxHashMap<usize, Float> = FxHashMap::default();
+
+                if let Some(neighbours) = adjacency.get(i) {
+                    neighbours.iter().for_each(|(indx, weight)| {
+                        if coreset_set.contains(&indx) {
+                            let label = label_map[&indx];
+                            let neighbour_weight = weight_map[&indx];
+                            let neighbour_degree = *degree_map
+                                .get(&indx)
+                                .expect("degree missing for neighbour in labelling pass");
+
+                            let inner_prod_with_vertex = if i != indx {
+                                Float::from(*weight) / (vertex_degree * neighbour_degree)
+                            } else {
+                                Float::from(*weight) / (vertex_degree * neighbour_degree)
+                                    + shift / vertex_degree
+                            };
+
+                            x_to_c_is
+                                .entry(label)
+                                .and_modify(|e| {
+                                    *e += Float::from(neighbour_weight) * inner_prod_with_vertex;
+                                })
+                                .or_insert(Float::from(neighbour_weight) * inner_prod_with_vertex);
+                        }
+                    });
+                }
+
+                x_to_c_is.iter_mut().for_each(|(k, v)| {
+                    let denom = center_denoms[*k];
+                    if denom.is_finite() && denom != Float::from(0.0) {
+                        *v /= denom;
+                    } else {
+                        *v = Float::from(0.0);
+                    }
+                });
+
+                let mut best_center_value = smallest_center_by_norm_value;
+                let mut best_center = smallest_center_by_norm;
+
+                x_to_c_is
+                    .iter()
+                    .filter(|(center, _)| center_norms[**center].is_finite())
+                    .for_each(|(center, v)| {
+                        let distance = center_norms[*center] - Float::from(2.0) * *v;
+                        if distance < best_center_value {
+                            best_center = *center;
+                            best_center_value = distance;
+                        }
+                    });
+
+                (
+                    best_center,
+                    (best_center_value
+                        + Float::from(1.0) / (vertex_degree * vertex_degree)
+                        + shift / vertex_degree)
+                        .0,
+                )
+            })
+            .unzip();
+
+        (node_names, labels_and_distances.0, labels_and_distances.1)
     }
 }

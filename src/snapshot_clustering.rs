@@ -13,39 +13,46 @@ pub trait GraphLike {
     type V;
 
     fn neighbours(&self, node: &Self::V, time: i64) -> impl Iterator<Item = (Self::V, f64)> + Send;
+
+    fn num_nodes(&self, time: i64) -> usize;
+    fn nodes(&self, time: i64) -> Vec<Self::V>;
 }
 
 impl GraphLike for PersistentGraph {
     type V = VID;
     fn neighbours(&self, node: &Self::V, time: i64) -> impl Iterator<Item = (Self::V, f64)> + Send {
         let graph_at_time = self.at(time);
-        if graph_at_time.node(node).is_none() {
+        let node_at_time = graph_at_time.node(node);
+        if node_at_time.is_none() {
             panic!(
                 "neighbours() called for missing node {:?} at time {}",
                 node, time
             );
         }
-        graph_at_time
-            .node(node)
-            .unwrap()
-            .neighbours()
-            .iter()
-            .map(move |x| {
-                let nbr = x.node;
-                let w = graph_at_time
-                    .edge(node, &nbr)
-                    .and_then(|e| e.properties().get("w"))
-                    .and_then(|p| p.as_f64())
-                    .unwrap_or(0.0);
-                debug_assert!(
-                    w != 0.0,
-                    "neighbours() found zero weight between {:?} and {:?} at time {}",
-                    node,
-                    nbr,
-                    time
-                );
-                (nbr, w)
-            })
+        node_at_time.unwrap().neighbours().iter().map(move |x| {
+            let nbr = x.node;
+            let w = graph_at_time
+                .edge(node, &nbr)
+                .and_then(|e| e.properties().get("w"))
+                .and_then(|p| p.as_f64())
+                .unwrap_or(0.0);
+            debug_assert!(
+                w != 0.0,
+                "neighbours() found zero weight between {:?} and {:?} at time {}",
+                node,
+                nbr,
+                time
+            );
+            (nbr, w)
+        })
+    }
+
+    fn num_nodes(&self, time: i64) -> usize {
+        self.at(time).count_nodes()
+    }
+
+    fn nodes(&self, time: i64) -> Vec<Self::V> {
+        self.at(time).nodes().into_iter().map(|x| x.node).collect()
     }
 }
 
@@ -120,32 +127,34 @@ pub trait SnapshotClusteringAlg<V> {
         &mut self,
         diffs: &SnapshotDiffs<V>,
         graph: &(impl GraphLike<V = V> + Sync),
-        mut subset: Vec<V>,
-    ) {
+        subset: &[V],
+    ) -> Vec<(i64, PartitionOutput<V>)> {
         let mut out = Vec::with_capacity(diffs.snapshot_times.len());
         for (t, diff) in diffs.iter_node_diffs() {
             let time = *t;
             self.begin_snapshot(time);
             self.apply_node_ops(time, diff, graph);
-            let partition = self.extract_partition(time, PartitionType::Subset(&subset), graph);
+            let partition = self.extract_partition(time, PartitionType::Subset(subset), graph);
             out.push((time, partition));
         }
+        out
     }
 
     fn process_edge_diffs_with_subset(
         &mut self,
         diffs: &SnapshotDiffs<V>,
         graph: &(impl GraphLike<V = V> + Sync),
-        mut subset: Vec<V>,
-    ) {
+        subset: &[V],
+    ) -> Vec<(i64, PartitionOutput<V>)> {
         let mut out = Vec::with_capacity(diffs.snapshot_times.len());
         for (t, diff) in diffs.iter_edge_diffs() {
             let time = *t;
             self.begin_snapshot(time);
             self.apply_edge_ops(time, diff, graph);
-            let partition = self.extract_partition(time, PartitionType::Subset(&subset), graph);
+            let partition = self.extract_partition(time, PartitionType::Subset(subset), graph);
             out.push((time, partition));
         }
+        out
     }
 }
 

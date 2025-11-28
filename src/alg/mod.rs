@@ -7,7 +7,11 @@ use crate::{
     diff::ExtendedEdgeOp,
     snapshot_clustering::{GraphLike, PartitionOutput, PartitionType, SnapshotClusteringAlg},
 };
-use faer::{sparse::SparseRowMat, traits::num_traits::Zero};
+use faer::{
+    ColRef,
+    sparse::SparseRowMat,
+    traits::{Symbolic, num_traits::Zero},
+};
 use rayon::prelude::*;
 use std::{fmt::Debug, hash::Hash, num::NonZero, sync::Arc};
 
@@ -24,7 +28,15 @@ use faer::{
     col::Col,
     mat::Mat,
     matrix_free::eigen::{PartialEigenParams, partial_eigen, partial_eigen_scratch},
+    utils::bound::Idx,
 };
+
+use linfa::{
+    DatasetBase,
+    traits::{Fit, Predict},
+};
+use linfa_clustering::KMeans;
+use ndarray::{Array1, ArrayView2, ShapeBuilder};
 use num_complex::Complex;
 use rand::{Rng, SeedableRng, rngs::StdRng};
 
@@ -64,7 +76,7 @@ pub struct DynamicClustering<const ARITY: usize, V> {
 
     pub num_clusters: usize,
     pub cluster_alg:
-        Arc<dyn Fn(&SparseRowMat<usize, f64>, usize) -> Vec<usize> + Send + Sync + 'static>,
+        Arc<dyn Fn(&mut SparseRowMat<usize, f64>, usize) -> Vec<usize> + Send + Sync + 'static>,
 }
 
 impl<const ARITY: usize, V: std::hash::Hash + Eq + Clone + Copy> DynamicClustering<ARITY, V> {
@@ -73,7 +85,7 @@ impl<const ARITY: usize, V: std::hash::Hash + Eq + Clone + Copy> DynamicClusteri
         coreset_size: usize,
         sampling_seeds: usize,
         num_clusters: usize,
-        cluster_alg: fn(&SparseRowMat<usize, f64>, usize) -> Vec<usize>,
+        cluster_alg: fn(&mut SparseRowMat<usize, f64>, usize) -> Vec<usize>,
     ) -> Self {
         Self {
             node_to_tree_map: Default::default(),
@@ -141,27 +153,44 @@ impl<const ARITY: usize, V: std::hash::Hash + Eq + Clone + Copy + Send + Sync>
         graph: &(impl GraphLike<V = V> + Sync),
     ) -> PartitionOutput<V> {
         // extract coreset:
-        let coreset = self
+        let mut coreset = self
             .extract_coreset(graph, self.coreset_size, self.sampling_seeds, time)
             .unwrap();
 
         // println!("{}", coreset.nodes.len());
-        let coreset_graph = self.build_coreset_graph(&coreset, time, graph);
+        let mut coreset_graph = self.build_coreset_graph(&coreset, time, graph);
 
-        let coreset_labels = (self.cluster_alg)(&coreset_graph, self.num_clusters);
+        let coreset_labels = (self.cluster_alg)(&mut coreset_graph, self.num_clusters);
 
-        let result = coreset.nodes.into_iter().zip(coreset_labels).collect();
+        coreset.coreset_labels = Some(coreset_labels.clone());
 
-        PartitionOutput::All(result)
-        // PartitionOutput::Subset(Vec::new())
+        let nodes_to_label = match part_type {
+            PartitionType::All => None,
+            PartitionType::Subset(nodes) => Some(nodes),
+        };
+
+        let (names, labels, _distances) =
+            self.rust_label_full_graph(&coreset, self.num_clusters, time, graph, nodes_to_label);
+
+        match part_type {
+            PartitionType::All => {
+                let result = names.into_iter().zip(labels).collect();
+                PartitionOutput::All(result)
+            }
+            PartitionType::Subset(_) => PartitionOutput::Subset(labels),
+        }
     }
 }
 
-pub fn cluster(graph: &SparseRowMat<usize, f64>, k: usize) -> Vec<usize> {
+pub fn cluster(graph: &mut SparseRowMat<usize, f64>, k: usize) -> Vec<usize> {
     let n = graph.ncols();
     if n == 0 || k == 0 {
         return Vec::new();
     }
+
+    // Build M = I - 0.5 * (normalized Laplacian) directly from the adjacency and
+    // keep D^{-1/2} for optional embedding scaling.
+    let deg_inv_sqrt = build_shifted_normalized_laplacian(graph);
 
     // Random initial vector v0, normalised.
     let mut rng = StdRng::seed_from_u64(42);
@@ -173,26 +202,104 @@ pub fn cluster(graph: &SparseRowMat<usize, f64>, k: usize) -> Vec<usize> {
         }
     }
 
+    // We need the k largest eigenpairs of M (which correspond to the smallest of the normalized Laplacian).
     let params = PartialEigenParams::default();
-    let par = Par::Rayon(NonZero::new(16).unwrap());
+
+    let par = Par::Rayon(NonZero::new(4).unwrap());
     let scratch = partial_eigen_scratch(graph, k, par, params);
     let mut stack_buf = MemBuffer::new(scratch);
-    let mut stack = MemStack::new(&mut stack_buf);
+    let stack = MemStack::new(&mut stack_buf);
 
-    let mut eigvecs = Mat::zeros(n, k);
+    let mut eigvecs_cplx = Mat::<Complex<f64>>::zeros(n, k);
     let mut eigvals = vec![Complex::new(0.0, 0.0); k];
 
     let _info = partial_eigen(
-        eigvecs.as_mut(),
+        eigvecs_cplx.as_mut(),
         eigvals.as_mut_slice(),
         graph,
         v0.as_ref(),
         f64::EPSILON * 128.0,
         par,
-        &mut stack,
+        stack,
         params,
     );
 
-    // Placeholder clustering: assign all nodes to cluster 0.
-    vec![eigvals[0].re as usize; n]
+    // take real part of eigenvectors
+    let mut eigvecs = Mat::from_fn(n, k, |i, j| eigvecs_cplx[(i, j)].re);
+
+    // normalise embeddings by deg_inv_sqrt vector returned from the builder
+    let deg_inv_sqrt = ColRef::from_slice(deg_inv_sqrt.as_slice());
+    for mut col in eigvecs.as_mut().col_iter_mut() {
+        faer::zip!(&mut col, &deg_inv_sqrt).for_each(|faer::unzip!(val, &scale)| {
+            *val *= scale;
+        });
+    }
+
+    kmeans_labels(&eigvecs, k)
+}
+
+/// Build M = I - 0.5 * (normalized Laplacian) in-place on `mat`,
+/// i.e., M = 0.5 * I + 0.5 * D^{-1/2} A D^{-1/2}, computed directly from A.
+pub fn build_shifted_normalized_laplacian(mat: &mut SparseRowMat<usize, f64>) -> Vec<f64> {
+    let (symbolic, vals) = mat.parts_mut();
+    let (nrows, _ncols, row_ptr, _row_nnz, col_idx) = symbolic.parts();
+
+    let mut deg = vec![0.0; nrows];
+    let mut deg_inv_sqrt = vec![0.0; nrows];
+    for i in 0..nrows {
+        let start = row_ptr[i];
+        let end = row_ptr[i + 1];
+        for idx in start..end {
+            deg[i] += vals[idx];
+        }
+        if deg[i] > 0.0 {
+            deg_inv_sqrt[i] = 1.0 / deg[i].sqrt();
+        }
+    }
+
+    // First write 0.5 * D^{-1/2} A D^{-1/2} into vals.
+    for i in 0..nrows {
+        let start = row_ptr[i];
+        let end = row_ptr[i + 1];
+        let di: f64 = deg_inv_sqrt[i];
+        for idx in start..end {
+            let j = col_idx[idx];
+            let dj = deg_inv_sqrt[j];
+            if di > 0.0 && dj > 0.0 {
+                vals[idx] = 0.5 * (vals[idx] * di * dj);
+                if i == j {
+                    vals[idx] += 0.5;
+                }
+            } else {
+                vals[idx] = if i == j { 0.5 } else { 0.0 };
+            }
+        }
+    }
+    deg_inv_sqrt
+}
+
+pub fn kmeans_labels(embeddings: &Mat<f64>, k: usize) -> Vec<usize> {
+    let nrows = embeddings.nrows();
+    let ncols = embeddings.ncols();
+    if nrows == 0 || ncols == 0 || k == 0 {
+        return Vec::new();
+    }
+
+    let k = k.min(nrows);
+    // zero-copy view into faer storage using its actual strides
+    let emb_ref = embeddings.as_ref();
+    let stride_row = emb_ref.row_stride();
+    let stride_col = emb_ref.col_stride();
+    let shape = (nrows, ncols).strides((stride_row as usize, stride_col as usize));
+    let view: ArrayView2<'_, f64> = unsafe { ArrayView2::from_shape_ptr(shape, emb_ref.as_ptr()) };
+    let dummy_targets = Array1::from_elem(nrows, ());
+    let dataset = DatasetBase::new(view, dummy_targets);
+    let model = KMeans::params(k)
+        .init_method(linfa_clustering::KMeansInit::KMeansPlusPlus)
+        .n_runs(3)
+        .max_n_iterations(100)
+        .fit(&dataset)
+        .expect("k-means fit failed");
+    let labels = model.predict(&dataset);
+    labels.into_raw_vec_and_offset().0
 }

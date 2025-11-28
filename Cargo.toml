@@ -17,6 +17,10 @@ dyn-stack = "0.13.2"
 faer = "0.23.2"
 indicatif = "0.18.2"
 itertools = "0.14.0"
+linfa = { version = "0.8.0", features = ["blas"] }
+linfa-clustering = "0.8.0"
+ndarray = "0.16.1"
+ndarray-linalg = "0.17"
 num-complex = "0.4.6"
 
 ordered-float = "5.1.0"

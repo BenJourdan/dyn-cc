@@ -3,8 +3,140 @@ use rand::prelude::*;
 use raphtory::core::entities::VID;
 use raphtory::db::graph::views::deletion_graph::PersistentGraph;
 use raphtory::prelude::*;
-use std::collections::HashMap;
 use std::collections::hash_map::Entry;
+use std::collections::{HashMap, VecDeque};
+
+use crate::diff::build_snapshot_diffs;
+
+pub fn adjusted_rand_index(labels_true: &[usize], labels_pred: &[usize]) -> f64 {
+    assert_eq!(
+        labels_true.len(),
+        labels_pred.len(),
+        "label arrays must be the same length"
+    );
+    if labels_true == labels_pred {
+        return 1.0;
+    }
+    let n = labels_true.len();
+    if n < 2 {
+        return 1.0;
+    }
+
+    let mut contingency: HashMap<(usize, usize), usize> = HashMap::new();
+    let mut count_true: HashMap<usize, usize> = HashMap::new();
+    let mut count_pred: HashMap<usize, usize> = HashMap::new();
+
+    for (&t, &p) in labels_true.iter().zip(labels_pred.iter()) {
+        *contingency.entry((t, p)).or_insert(0) += 1;
+        *count_true.entry(t).or_insert(0) += 1;
+        *count_pred.entry(p).or_insert(0) += 1;
+    }
+
+    let choose2 = |x: usize| -> f64 { (x as f64) * ((x as f64) - 1.0) / 2.0 };
+
+    let sum_comb_c = contingency.values().fold(0.0, |acc, &v| acc + choose2(v));
+    let sum_comb_true = count_true.values().fold(0.0, |acc, &v| acc + choose2(v));
+    let sum_comb_pred = count_pred.values().fold(0.0, |acc, &v| acc + choose2(v));
+
+    let total_pairs = choose2(n);
+    let expected_index = (sum_comb_true * sum_comb_pred) / total_pairs;
+    let max_index = 0.5 * (sum_comb_true + sum_comb_pred);
+
+    if (max_index - expected_index).abs() < f64::EPSILON {
+        0.0
+    } else {
+        (sum_comb_c - expected_index) / (max_index - expected_index)
+    }
+}
+
+pub fn build_graph(nodes: &[String], operations: &[Instruction]) -> PersistentGraph {
+    let graph = PersistentGraph::new();
+
+    for op in operations {
+        match *op {
+            Instruction::Insert(t, u_idx, v_idx, w) => {
+                let u = &nodes[u_idx];
+                let v = &nodes[v_idx];
+                let old_edge_weight = graph
+                    .at(t)
+                    .edge(u, v)
+                    .map(|e| e.properties().get("w").unwrap().as_f64().unwrap())
+                    .unwrap_or(0.0);
+
+                graph
+                    .add_edge(t, u, v, [("w", Prop::F64(old_edge_weight + w))], None)
+                    .unwrap();
+                graph
+                    .add_edge(t, v, u, [("w", Prop::F64(old_edge_weight + w))], None)
+                    .unwrap();
+            }
+            Instruction::Delete(t, u_idx, v_idx) => {
+                let u = &nodes[u_idx];
+                let v = &nodes[v_idx];
+                // Ignore missing edges; this only happens if a delete races a duplicate insert.
+                let _ = graph.delete_edge(t, u, v, None);
+                let _ = graph.delete_edge(t, v, u, None);
+            }
+            Instruction::DeletePartial(t, u_idx, v_idx, w) => {
+                let u = &nodes[u_idx];
+                let v = &nodes[v_idx];
+                if w == 0.0 {
+                    let _ = graph.delete_edge(t, u, v, None);
+                    let _ = graph.delete_edge(t, v, u, None);
+                } else {
+                    graph
+                        .add_edge(t, u, v, [("w", Prop::F64(w))], None)
+                        .unwrap();
+                    graph
+                        .add_edge(t, v, u, [("w", Prop::F64(w))], None)
+                        .unwrap();
+                }
+            }
+        }
+    }
+
+    graph
+}
+
+pub fn prepare_diff_workload_sbm(
+    seed: u64,
+    n_per_cluster: usize,
+    k_clusters: usize,
+    p_internal: f64,
+    q_external: f64,
+    n_multiplier: usize,
+    lifetime_multiplier: f64,
+    step_size: f64,
+) -> (
+    Vec<String>,
+    crate::diff::SnapshotDiffs<VID>,
+    PersistentGraph,
+    Vec<usize>,
+) {
+    let (cmds, _, cluster_labels) = generate_sbm_commands(
+        seed,
+        n_per_cluster,
+        k_clusters,
+        p_internal,
+        q_external,
+        n_multiplier,
+        lifetime_multiplier,
+    );
+    let graph = build_graph(&cmds.nodes, &cmds.operations);
+
+    let start = graph.earliest_time().expect("graph has edges");
+    let end = graph.latest_time().expect("graph has edges");
+
+    let step_size = (step_size * (end - start) as f64) as usize;
+    println!("num commands: {}", cmds.operations.len());
+    println!("timespan: {}", end - start);
+    println!("Step size: {}", step_size);
+
+    let diffs = build_snapshot_diffs(&graph, (start + end) / 2, end, step_size, "w", 1e-9)
+        .expect("snapshot diffs should build");
+
+    (cmds.nodes, diffs, graph, cluster_labels)
+}
 
 pub struct GeneratedCommands {
     pub nodes: Vec<String>,
@@ -14,7 +146,7 @@ pub struct GeneratedCommands {
 pub enum Instruction {
     Insert(i64, usize, usize, f64),
     Delete(i64, usize, usize),
-    DeleteHalf(i64, usize, usize, f64),
+    DeletePartial(i64, usize, usize, f64),
 }
 
 pub fn generate_commands(
@@ -128,18 +260,12 @@ pub fn generate_commands_fast(
                         remove_edge_key((u, v), &mut edge_keys, &mut edge_index);
                         remove_edge_key((v, u), &mut edge_keys, &mut edge_index);
                     } else {
-                        // delete half the weight
+                        // delete half the weight: new_w is the post-delete weight
                         let new_w: f64 = w / 2.0;
-                        operations.push(Instruction::DeleteHalf(counter, u, v, new_w));
-                        // update the known edges
-                        known_edges
-                            .entry((u, v))
-                            .and_modify(|e| *e -= new_w)
-                            .or_insert(new_w);
-                        known_edges
-                            .entry((v, u))
-                            .and_modify(|e| *e -= new_w)
-                            .or_insert(new_w);
+                        operations.push(Instruction::DeletePartial(counter, u, v, new_w));
+                        // update the known edges to the new weight
+                        known_edges.insert((u, v), new_w);
+                        known_edges.insert((v, u), new_w);
                     }
                 }
             }
@@ -150,6 +276,144 @@ pub fn generate_commands_fast(
     }
     pb.finish_with_message("Done generating instructions");
     GeneratedCommands { nodes, operations }
+}
+
+/// Generate an SBM-style stream of edge updates with finite lifetimes.
+pub fn generate_sbm_commands(
+    seed: u64,
+    n_per_cluster: usize,
+    k_clusters: usize,
+    p_internal: f64,
+    q_external: f64,
+    n_multiplier: usize,
+    lifetime_multiplier: f64,
+) -> (GeneratedCommands, usize, Vec<usize>) {
+    let mut rng = StdRng::seed_from_u64(seed);
+
+    let total_nodes = n_per_cluster * k_clusters;
+    let nodes: Vec<String> = (0..k_clusters)
+        .flat_map(|c| (0..n_per_cluster).map(move |i| format!("C{}_{}", c, i)))
+        .collect();
+
+    // node indices grouped by cluster for fast sampling
+    let cluster_nodes: Vec<Vec<usize>> = (0..k_clusters)
+        .map(|c| {
+            let start = c * n_per_cluster;
+            (start..start + n_per_cluster).collect()
+        })
+        .collect();
+
+    let mut edge_weights: HashMap<(usize, usize), f64> = HashMap::new();
+    // Track additions to expire after `lifetime` steps.
+    let mut expirations: VecDeque<(i64, (usize, usize))> = VecDeque::new();
+
+    // Expected edge count of an SBM(k, n_per_cluster, p_internal, q_external).
+    let expected_internal = (k_clusters as f64)
+        * (n_per_cluster as f64)
+        * ((n_per_cluster - 1) as f64)
+        * 0.5
+        * p_internal;
+    let expected_external = (k_clusters * (k_clusters - 1)) as f64
+        * 0.5
+        * (n_per_cluster * n_per_cluster) as f64
+        * q_external;
+    let expected_edges = expected_internal + expected_external;
+
+    let num_updates = ((n_multiplier as f64) * expected_edges).ceil() as usize;
+    let lifetime_steps = (lifetime_multiplier * expected_edges).ceil() as i64;
+
+    let mut operations: Vec<Instruction> = Vec::with_capacity(num_updates * 2);
+    let mut t: i64 = 0;
+
+    let total_weight = expected_internal + expected_external;
+    let internal_prob = if total_weight > 0.0 {
+        expected_internal / total_weight
+    } else {
+        0.5
+    };
+
+    let mut pick_internal = |rng: &mut StdRng, cluster_nodes: &[Vec<usize>]| -> (usize, usize) {
+        let c = rng.random_range(0..cluster_nodes.len());
+        let cluster = &cluster_nodes[c];
+        if cluster.len() == 1 {
+            return (cluster[0], cluster[0]);
+        }
+        let a = rng.random_range(0..cluster.len());
+        let mut b = rng.random_range(0..cluster.len());
+        while b == a {
+            b = rng.random_range(0..cluster.len());
+        }
+        (cluster[a], cluster[b])
+    };
+
+    let mut pick_cross = |rng: &mut StdRng, cluster_nodes: &[Vec<usize>]| -> (usize, usize) {
+        if cluster_nodes.len() < 2 {
+            return pick_internal(rng, cluster_nodes);
+        }
+        let c1 = rng.random_range(0..cluster_nodes.len());
+        let mut c2 = rng.random_range(0..cluster_nodes.len());
+        while c2 == c1 {
+            c2 = rng.random_range(0..cluster_nodes.len());
+        }
+        let u_cluster = &cluster_nodes[c1];
+        let v_cluster = &cluster_nodes[c2];
+        (
+            u_cluster[rng.random_range(0..u_cluster.len())],
+            v_cluster[rng.random_range(0..v_cluster.len())],
+        )
+    };
+
+    for _ in 0..num_updates {
+        // expire old edges
+        while let Some(&(added_at, (u, v))) = expirations.front() {
+            if t - added_at >= lifetime_steps {
+                expirations.pop_front();
+                let key = if u <= v { (u, v) } else { (v, u) };
+                if let Some(w) = edge_weights.get_mut(&key) {
+                    let new_w = (*w - 1.0).max(0.0);
+                    *w = new_w;
+                    if new_w == 0.0 {
+                        edge_weights.remove(&key);
+                        operations.push(Instruction::Delete(t, u, v));
+                    } else {
+                        operations.push(Instruction::DeletePartial(t, u, v, new_w));
+                    }
+                }
+            } else {
+                break;
+            }
+        }
+
+        // choose edge type and endpoints
+        let (u, v) = if rng.random_range(0.0..1.0) < internal_prob {
+            pick_internal(&mut rng, &cluster_nodes)
+        } else {
+            pick_cross(&mut rng, &cluster_nodes)
+        };
+        if u == v {
+            continue;
+        }
+
+        // add/update edge
+        operations.push(Instruction::Insert(t, u, v, 1.0));
+        let key = if u <= v { (u, v) } else { (v, u) };
+        *edge_weights.entry(key).or_insert(0.0) += 1.0;
+        expirations.push_back((t, (u, v)));
+
+        // Always advance time.
+        t += 1;
+    }
+
+    let mut cluster_labels = Vec::with_capacity(total_nodes);
+    for c in 0..k_clusters {
+        cluster_labels.extend(std::iter::repeat(c).take(n_per_cluster));
+    }
+
+    (
+        GeneratedCommands { nodes, operations },
+        expected_edges as usize,
+        cluster_labels,
+    )
 }
 
 #[test]
@@ -188,24 +452,18 @@ fn diffs_replay_matches_graph_snapshots() {
                 let _ = graph.delete_edge(t, u, v, None);
                 let _ = graph.delete_edge(t, v, u, None);
             }
-            Instruction::DeleteHalf(t, u_idx, v_idx, w) => {
+            Instruction::DeletePartial(t, u_idx, v_idx, w) => {
                 let u = &cmds.nodes[u_idx];
                 let v = &cmds.nodes[v_idx];
-                let old_w = graph
-                    .at(t)
-                    .edge(u, v)
-                    .map(|e| e.properties().get("w").unwrap().as_f64().unwrap())
-                    .unwrap_or(0.0);
-                let new_w = (old_w - w).max(0.0);
-                if new_w == 0.0 {
+                if w == 0.0 {
                     let _ = graph.delete_edge(t, u, v, None);
                     let _ = graph.delete_edge(t, v, u, None);
                 } else {
                     graph
-                        .add_edge(t, u, v, [("w", Prop::F64(new_w))], None)
+                        .add_edge(t, u, v, [("w", Prop::F64(w))], None)
                         .unwrap();
                     graph
-                        .add_edge(t, v, u, [("w", Prop::F64(new_w))], None)
+                        .add_edge(t, v, u, [("w", Prop::F64(w))], None)
                         .unwrap();
                 }
             }
@@ -331,24 +589,18 @@ fn dynamic_clustering_degrees_track_graph() {
                 let _ = graph.delete_edge(t, u, v, None);
                 let _ = graph.delete_edge(t, v, u, None);
             }
-            Instruction::DeleteHalf(t, u_idx, v_idx, w) => {
+            Instruction::DeletePartial(t, u_idx, v_idx, w) => {
                 let u = &cmds.nodes[u_idx];
                 let v = &cmds.nodes[v_idx];
-                let old_w = graph
-                    .at(t)
-                    .edge(u, v)
-                    .map(|e| e.properties().get("w").unwrap().as_f64().unwrap())
-                    .unwrap_or(0.0);
-                let new_w = (old_w - w).max(0.0);
-                if new_w == 0.0 {
+                if w == 0.0 {
                     let _ = graph.delete_edge(t, u, v, None);
                     let _ = graph.delete_edge(t, v, u, None);
                 } else {
                     graph
-                        .add_edge(t, u, v, [("w", Prop::F64(new_w))], None)
+                        .add_edge(t, u, v, [("w", Prop::F64(w))], None)
                         .unwrap();
                     graph
-                        .add_edge(t, v, u, [("w", Prop::F64(new_w))], None)
+                        .add_edge(t, v, u, [("w", Prop::F64(w))], None)
                         .unwrap();
                 }
             }

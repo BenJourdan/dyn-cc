@@ -2,104 +2,55 @@ mod alg;
 mod diff;
 mod snapshot_clustering;
 mod tests;
-use core::time;
 
-use indicatif::ProgressBar;
 use raphtory::db::graph::views::deletion_graph::PersistentGraph;
 use raphtory::{core::entities::VID, prelude::*};
-use std::time::{Duration, Instant};
-
-use tests::{GeneratedCommands, Instruction, generate_commands};
+use std::time::Instant;
 
 use diff::build_snapshot_diffs;
 use snapshot_clustering::MyClustering;
+use tests::{GeneratedCommands, Instruction, build_graph, generate_commands, generate_sbm_commands};
 
+use crate::tests::{adjusted_rand_index, prepare_diff_workload_sbm};
 use crate::{alg::DynamicClustering, snapshot_clustering::SnapshotClusteringAlg};
 
 fn main() {
-    let num_nodes = 10_000;
-    let num_updates = 10_000_000;
-    let step = 100_000;
-    let coreset_size = 2048;
-    let sampling_seeds = 64;
-    let num_clusters = 20;
+    const ARITY: usize = 64;
 
-    const ARITY: usize = 8;
+    let num_clusters = 100;
+    let coreset_size = 4096;
+    let sampling_seeds = num_clusters * 4;
 
-    let GeneratedCommands { nodes, operations } =
-        generate_commands(42424242, num_nodes, num_updates, 0.6, 0.9, 0.5);
-
-    let graph = PersistentGraph::new();
-
-    let pb = ProgressBar::new(num_updates as u64);
-    pb.set_style(indicatif::ProgressStyle::default_bar()
-        .template("{spinner:.green} {bar:.green/yellow} {decimal_bytes_per_sec} {eta} [{elapsed_precise}] ").unwrap());
+    let n_per_cluster = 512;
 
     let t0 = Instant::now();
 
-    for command in operations {
-        pb.inc(1);
-        match command {
-            Instruction::Insert(t, u_idx, v_idx, w) => {
-                let u = &nodes[u_idx];
-                let v = &nodes[v_idx];
-                let old_edge_weight = graph
-                    .at(t)
-                    .edge(u, v)
-                    .map(|e| e.properties().get("w").unwrap().as_f64().unwrap())
-                    .unwrap_or(0.0);
+    let subset_size = num_clusters * n_per_cluster / 100;
 
-                graph
-                    .add_edge(t, u, v, [("w", Prop::F64(old_edge_weight + w))], None)
-                    .unwrap();
-                graph
-                    .add_edge(t, v, u, [("w", Prop::F64(old_edge_weight + w))], None)
-                    .unwrap();
-            }
-            Instruction::Delete(t, u_idx, v_idx) => {
-                let u = &nodes[u_idx];
-                let v = &nodes[v_idx];
-                graph.delete_edge(t, u, v, None).unwrap();
-                graph.delete_edge(t, v, u, None).unwrap();
-            }
-            Instruction::DeleteHalf(t, u_idx, v_idx, w) => {
-                let u = &nodes[u_idx];
-                let v = &nodes[v_idx];
-                let old_edge_weight = graph
-                    .at(t)
-                    .edge(u, v)
-                    .map(|e| e.properties().get("w").unwrap().as_f64().unwrap())
-                    .unwrap_or(0.0);
-                let new_weight = (old_edge_weight - w).max(0.0);
-                if new_weight == 0.0 {
-                    graph.delete_edge(t, u, v, None).unwrap();
-                    graph.delete_edge(t, v, u, None).unwrap();
-                } else {
-                    graph
-                        .add_edge(t, u, v, [("w", Prop::F64(new_weight))], None)
-                        .unwrap();
-                    graph
-                        .add_edge(t, v, u, [("w", Prop::F64(new_weight))], None)
-                        .unwrap();
-                }
-            }
-        }
-    }
-    pb.finish_with_message("processed updates");
-    println!("Graph build time: {:?}", t0.elapsed());
+    let (nodes, diffs, graph, cluster_labels) = prepare_diff_workload_sbm(
+        42,
+        n_per_cluster,                                      // nodes per cluster
+        num_clusters,                                       // clusters
+        0.5,                                                // p_internal
+        1.0 / (n_per_cluster as f64 * num_clusters as f64), // q_external
+        1,                                                  // multiplier for expected edges
+        1.0,                                                // lifetime multiplier
+        0.1,                                                // step size
+    );
 
-    let start = graph.earliest_time().unwrap();
-    let end = graph.latest_time().unwrap();
+    let subset = nodes[..subset_size]
+        .iter()
+        .map(|s| graph.node(s).unwrap().node)
+        .collect::<Vec<_>>();
+    let subset_labels = cluster_labels[..subset_size].to_vec();
+    assert_eq!(
+        adjusted_rand_index(subset_labels.as_slice(), subset_labels.as_slice()),
+        1.0
+    );
 
-    println!("start: {start}, end: {end}");
-
-    let t1 = Instant::now();
-
-    let diffs = build_snapshot_diffs(&graph, (start + end) / 2, end, step, "w", 1e-9).unwrap();
-    println!("Diff build time: {:?}", t1.elapsed());
+    println!("Command/Graph/Diff build time: {:?}", t0.elapsed());
     println!("Number of diffs: {}", diffs.node_diffs.len());
 
-    let t2 = Instant::now();
     let mut cluster_alg: DynamicClustering<ARITY, VID> = alg::DynamicClustering::new(
         1000.0.into(),
         coreset_size,
@@ -108,6 +59,24 @@ fn main() {
         alg::cluster,
     );
 
-    let part = cluster_alg.process_node_diffs(&diffs, &graph);
+    let t2 = Instant::now();
+    let partitions = cluster_alg.process_node_diffs_with_subset(&diffs, &graph, subset.as_slice());
+    let aris: Vec<f64> = {
+        partitions
+            .iter()
+            .map(|(_t, part)| match part {
+                crate::snapshot_clustering::PartitionOutput::All(_) => unreachable!(),
+                crate::snapshot_clustering::PartitionOutput::Subset(predicted_labels) => {
+                    assert!(subset_labels.len() == predicted_labels.len());
+                    adjusted_rand_index(
+                        subset_labels.as_slice(),
+                        predicted_labels.as_slice(),
+                    )
+                }
+            })
+            .collect()
+    };
+    println!("ARIs: {:?}", aris);
+
     println!("Clustering time: {:?}", t2.elapsed());
 }
