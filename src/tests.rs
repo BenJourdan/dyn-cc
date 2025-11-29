@@ -5,6 +5,7 @@ use raphtory::db::graph::views::deletion_graph::PersistentGraph;
 use raphtory::prelude::*;
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, VecDeque};
+use std::time;
 
 use crate::diff::build_snapshot_diffs;
 
@@ -122,8 +123,9 @@ pub fn prepare_diff_workload_sbm(
         n_multiplier,
         lifetime_multiplier,
     );
+    let t0 = time::Instant::now();
     let graph = build_graph(&cmds.nodes, &cmds.operations);
-
+    println!("graph building took {}s", t0.elapsed().as_secs());
     let start = graph.earliest_time().expect("graph has edges");
     let end = graph.latest_time().expect("graph has edges");
 
@@ -132,7 +134,7 @@ pub fn prepare_diff_workload_sbm(
     println!("timespan: {}", end - start);
     println!("Step size: {}", step_size);
 
-    let diffs = build_snapshot_diffs(&graph, (start + end) / 2, end, step_size, "w", 1e-9)
+    let diffs = build_snapshot_diffs(&graph, start+step_size as i64, end, step_size, "w", 1e-9)
         .expect("snapshot diffs should build");
 
     (cmds.nodes, diffs, graph, cluster_labels)

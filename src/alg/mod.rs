@@ -106,7 +106,6 @@ impl<const ARITY: usize, V: std::hash::Hash + Eq + Clone + Copy> DynamicClusteri
 impl<const ARITY: usize, V: std::hash::Hash + Eq + Clone + Copy + Send + Sync>
     SnapshotClusteringAlg<V> for DynamicClustering<ARITY, V>
 {
-    fn apply_edge_ops(&mut self, time: i64, ops: &[ExtendedEdgeOp<V>], graph: &impl GraphLike) {}
 
     fn apply_node_ops(&mut self, time: i64, ops: &NodeOps<V>, _graph: &impl GraphLike) {
         debug_assert_eq!(ops.created_fresh.0.len(), ops.created_fresh.1.len());

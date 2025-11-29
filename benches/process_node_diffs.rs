@@ -1,10 +1,12 @@
+use core::num;
 use std::collections::HashMap;
 
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
-use dyn_cc::alg::DynamicClustering;
+use dyn_cc::{alg::DynamicClustering, snapshot_clustering::DiffGraph};
 use dyn_cc::diff::build_snapshot_diffs;
 use dyn_cc::snapshot_clustering::SnapshotClusteringAlg;
 use rand::{Rng, SeedableRng, rngs::StdRng};
+use rand::seq::SliceRandom;
 use raphtory::core::entities::VID;
 use raphtory::db::graph::views::deletion_graph::PersistentGraph;
 use raphtory::prelude::*;
@@ -23,7 +25,7 @@ fn bench_process_node_diffs(c: &mut Criterion) {
 
     let n_per_cluster = 512;
 
-    let (nodes, diffs, graph, cluster_labels) = prepare_diff_workload_sbm(
+    let (nodes, diffs, mut graph, cluster_labels) = prepare_diff_workload_sbm(
         42,
         n_per_cluster,                                      // nodes per cluster
         num_clusters,                                       // clusters
@@ -34,14 +36,23 @@ fn bench_process_node_diffs(c: &mut Criterion) {
         0.1,                                                // step size
     );
 
-    let subset_size = n_per_cluster * num_clusters / 10;
+    let subset_size = n_per_cluster * num_clusters / 100;
 
-    let subset = nodes[..subset_size]
+    // sample a uniform subset of nodes to avoid prefix bias
+    let mut rng = StdRng::seed_from_u64(42);
+    let mut subset_indices: Vec<usize> = (0..nodes.len()).collect();
+    subset_indices.shuffle(&mut rng);
+    subset_indices.truncate(subset_size.min(nodes.len()));
+
+    let subset = subset_indices
         .iter()
-        .map(|s| graph.node(s).unwrap().node)
+        .map(|&i| graph.node(&nodes[i]).unwrap().node)
         .collect::<Vec<_>>();
 
-    let subset_labels = cluster_labels[..subset_size].to_vec();
+    let subset_labels = subset_indices
+        .iter()
+        .map(|&i| cluster_labels[i])
+        .collect::<Vec<_>>();
 
     assert_eq!(
         adjusted_rand_index(subset_labels.as_slice(), subset_labels.as_slice()),
@@ -57,7 +68,9 @@ fn bench_process_node_diffs(c: &mut Criterion) {
                 num_clusters,
                 dyn_cc::alg::cluster,
             );
-            let partitions = alg.process_node_diffs_with_subset(&diffs, &graph, subset.as_slice());
+            let mut graph = DiffGraph::with_capacity(n_per_cluster*num_clusters);
+
+            let partitions = alg.process_node_diffs_with_subset(&diffs, &mut graph, subset.as_slice());
             // let partitions = alg.process_node_diffs(&diffs, &graph);
             let aris: Vec<f64> = {
                 partitions
