@@ -536,6 +536,8 @@ impl<const ARITY: usize, V: std::hash::Hash + Eq + Clone + Copy> DynamicClusteri
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::{DynamicClustering, Float, TreeIndex, Volume};
     use crate::{alg::cluster, diff::NodeOps};
 
@@ -558,7 +560,7 @@ mod tests {
 
     #[test]
     fn insert_new_nodes_handles_height_changes() {
-        let mut clustering = TestClustering::new(Float::from(0.0), 1, 1, 1, cluster);
+        let mut clustering = TestClustering::new(Float::from(0.0), 1, 1, 1, Arc::new(cluster), String::from("w"));
 
         clustering.insert_fresh_nodes(&fresh_ops(&[1, 2], &[1.0, 2.0]));
         assert_eq!(clustering.num_leaves(), 2);
@@ -600,7 +602,7 @@ mod tests {
 
     #[test]
     fn rebuild_from_leaves_updates_multiple_levels() {
-        let mut clustering = TestClustering::new(Float::from(0.0), 1, 1, 1, cluster);
+        let mut clustering = TestClustering::new(Float::from(0.0), 1, 1, 1, Arc::new(cluster), String::from("w"));
         clustering.insert_fresh_nodes(&fresh_ops(
             &[10, 11, 12, 13, 14],
             &[1.0, 2.0, 3.0, 4.0, 5.0],

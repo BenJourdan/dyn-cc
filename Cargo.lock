@@ -1535,8 +1535,6 @@ dependencies = [
 [[package]]
 name = "pometry-storage"
 version = "0.16.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9502c5d76dd8c157c3c6c4492783092d02fc1bff0f013b3826cdec74da5b82f9"
 
 [[package]]
 name = "portable-atomic"
@@ -1773,8 +1771,6 @@ dependencies = [
 [[package]]
 name = "raphtory"
 version = "0.16.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9b1d367dd76f0a25a17fc360fd404a7dcb590a7a3187461179cb7ab41fd46f0d"
 dependencies = [
  "ahash",
  "bigdecimal",
@@ -1816,8 +1812,6 @@ dependencies = [
 [[package]]
 name = "raphtory-api"
 version = "0.16.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ab9116c3a8f32d4aaddb4d1dbd2b49ad7266631984443483c0d0d5814d85d58c"
 dependencies = [
  "bigdecimal",
  "bytemuck",
@@ -1842,8 +1836,6 @@ dependencies = [
 [[package]]
 name = "raphtory-core"
 version = "0.16.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b87ba6acf56234b7294ae88275a5c2aa2308f5a3df808d7b191d07f68eae6093"
 dependencies = [
  "bigdecimal",
  "chrono",
@@ -1866,8 +1858,6 @@ dependencies = [
 [[package]]
 name = "raphtory-storage"
 version = "0.16.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4320b1bf41016fd869c6cd89af2cea08700a26d18b73dbc362b78aae2a82815a"
 dependencies = [
  "iter-enum",
  "itertools 0.13.0",

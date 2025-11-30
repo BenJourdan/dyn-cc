@@ -5,6 +5,7 @@ use raphtory::db::graph::views::deletion_graph::PersistentGraph;
 use raphtory::prelude::*;
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, VecDeque};
+use std::sync::Arc;
 use std::time;
 
 use crate::diff::build_snapshot_diffs;
@@ -641,7 +642,14 @@ fn dynamic_clustering_degrees_track_graph() {
 
     // Initialize clustering with arbitrary sigma/coreset params (not used for degree tracking).
     let mut clustering: DynamicClustering<8, VID> =
-        DynamicClustering::new(1.0.into(), 16, 4, 2, crate::alg::cluster);
+        DynamicClustering::new(
+            1.0.into(), 
+            16, 
+            4, 
+            2, 
+            Arc::new(crate::alg::cluster),
+            String::from("w")
+        );
 
     for (t_node, node_ops) in diffs.iter_node_diffs() {
         clustering.apply_node_ops(*t_node, node_ops, &graph);

@@ -272,7 +272,7 @@ impl<const ARITY: usize, V: std::hash::Hash + Eq + Clone + Copy + Send + Sync>
         let mut old_seeds = FxHashSet::default();
         old_seeds.insert(old_seed);
 
-        let neighbours = graph.neighbours(&point_added, time).collect::<Vec<_>>();
+        let neighbours = graph.neighbours(&point_added, time, &self.prop_name).collect::<Vec<_>>();
 
         // if point_added == info.x_star {
         //     println!("x_star has {} neighbours", neighbours.len());
@@ -380,7 +380,7 @@ impl<const ARITY: usize, V: std::hash::Hash + Eq + Clone + Copy + Send + Sync>
                 seed_weight != Float::from(0.0),
                 "old seed weight must be non-zero for h_s rescale"
             );
-            for z in graph.neighbours(&s, time).filter_map(|(neighbour, _)| {
+            for z in graph.neighbours(&s, time, &self.prop_name).filter_map(|(neighbour, _)| {
                 match info.get_seed(neighbour) == s {
                     true => Some(neighbour),
                     false => None,
@@ -445,7 +445,7 @@ impl<const ARITY: usize, V: std::hash::Hash + Eq + Clone + Copy + Send + Sync>
         let neighbour_list = coreset_indices
             .as_slice()
             .par_iter()
-            .map(|v| graph.neighbours(v, time).collect::<Vec<_>>())
+            .map(|v| graph.neighbours(v, time, &self.prop_name).collect::<Vec<_>>())
             .collect::<Vec<_>>();
 
         for (i, &node_name) in coreset_indices.iter().enumerate() {
@@ -546,7 +546,7 @@ impl<const ARITY: usize, V: std::hash::Hash + Eq + Clone + Copy + Send + Sync>
         // let t0 = std::time::Instant::now();
         let adjacency_vec = all_nodes
             .par_iter()
-            .map(|node| (*node, graph.neighbours(node, time).collect::<Vec<_>>()))
+            .map(|node| (*node, graph.neighbours(node, time, &self.prop_name).collect::<Vec<_>>()))
             .collect::<Vec<_>>();
         let adjacency: FxHashMap<_, _> = adjacency_vec.into_iter().collect();
         // println!("Took {} ms", t0.elapsed().as_millis());

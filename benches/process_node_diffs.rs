@@ -1,5 +1,6 @@
 use core::num;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use dyn_cc::{alg::DynamicClustering, snapshot_clustering::DiffGraph};
@@ -66,7 +67,8 @@ fn bench_process_node_diffs(c: &mut Criterion) {
                 coreset_size,
                 sampling_seeds,
                 num_clusters,
-                dyn_cc::alg::cluster,
+                Arc::new(dyn_cc::alg::cluster),
+                String::from("w")
             );
             let mut graph = DiffGraph::with_capacity(n_per_cluster*num_clusters);
 
@@ -76,8 +78,8 @@ fn bench_process_node_diffs(c: &mut Criterion) {
                 partitions
                     .iter()
                     .map(|(t, part)| match part {
-                        dyn_cc::snapshot_clustering::PartitionOutput::All(_) => unreachable!(),
-                        dyn_cc::snapshot_clustering::PartitionOutput::Subset(predicted_labels) => {
+                        dyn_cc::snapshot_clustering::PartitionOutput::All(_, _) => unreachable!(),
+                        dyn_cc::snapshot_clustering::PartitionOutput::Subset(predicted_labels, _) => {
                             assert!(subset_labels.len() == predicted_labels.len());
                             adjusted_rand_index(
                                 subset_labels.as_slice(),

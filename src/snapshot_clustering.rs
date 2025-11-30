@@ -15,7 +15,7 @@ pub trait GraphLike {
 
     fn process_extended_edge_diff(&mut self, diff:&[ExtendedEdgeOp<Self::V>]);
 
-    fn neighbours(&self, node: &Self::V, time: i64) -> impl Iterator<Item = (Self::V, f64)> + Send;
+    fn neighbours(&self, node: &Self::V, time: i64, prop: &str) -> impl Iterator<Item = (Self::V, f64)> + Send;
 
     fn num_nodes(&self, time: i64) -> usize;
     fn nodes(&self, time: i64) -> Vec<Self::V>;
@@ -24,7 +24,9 @@ pub trait GraphLike {
 
 impl GraphLike for PersistentGraph {
     type V = VID;
-    fn neighbours(&self, node: &Self::V, time: i64) -> impl Iterator<Item = (Self::V, f64)> + Send {
+
+    #[inline(always)]
+    fn neighbours(&self, node: &Self::V, time: i64, prop: &str) -> impl Iterator<Item = (Self::V, f64)> + Send {
         let graph_at_time = self.at(time);
         let node_at_time = graph_at_time.node(node);
         if node_at_time.is_none() {
@@ -37,7 +39,7 @@ impl GraphLike for PersistentGraph {
             let nbr = x.node;
             let w = graph_at_time
                 .edge(node, &nbr)
-                .and_then(|e| e.properties().get("w"))
+                .and_then(|e| e.properties().get(prop))
                 .and_then(|p| p.as_f64())
                 .unwrap_or(0.0);
             debug_assert!(
@@ -79,7 +81,9 @@ impl DiffGraph{
 
 impl  GraphLike for DiffGraph{
     type V = VID;
-    fn neighbours(&self, node: &Self::V, _time: i64) -> impl Iterator<Item = (Self::V, f64)> + Send {
+
+    #[inline(always)]
+    fn neighbours(&self, node: &Self::V, _time: i64, prop: &str) -> impl Iterator<Item = (Self::V, f64)> + Send {
         
         self.graph.get(node).unwrap().iter().map(|(k,v)|(*k,*v))
     }
@@ -158,8 +162,8 @@ pub enum PartitionType<'a, V> {
 
 #[derive(Debug)]
 pub enum PartitionOutput<V> {
-    All(FxHashMap<V, usize>),
-    Subset(Vec<usize>),
+    All(FxHashMap<V, usize>, usize),
+    Subset(Vec<usize>, usize),
 }
 
 /// Trait to be implemented by Clustering Algorithms that want to consume snapshot diffs
@@ -216,13 +220,13 @@ impl SnapshotClusteringAlg<VID> for MyClustering {
         _graph: &impl GraphLike,
     ) -> PartitionOutput<VID> {
         match part_type {
-            PartitionType::All => PartitionOutput::All(self.partition.clone()),
+            PartitionType::All => PartitionOutput::All(self.partition.clone(),0),
             PartitionType::Subset(items) => PartitionOutput::Subset(
                 items
                     .iter()
                     .map(|x| *self.partition.get(x).unwrap())
                     .collect::<Vec<usize>>(),
-            ),
+            0),
         }
     }
 }

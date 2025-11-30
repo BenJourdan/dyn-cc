@@ -50,6 +50,9 @@ pub struct TreeData<const ARITY: usize> {
     pub h_s: Vec<HS>,
 }
 
+type AlgType = Arc<dyn Fn(&mut SparseRowMat<usize, f64>, usize) -> (Vec<usize>, usize) + Send + Sync + 'static>;
+
+
 // #[derive(Debug)]
 pub struct DynamicClustering<const ARITY: usize, V> {
     // Map stable unique node Ids to tree indices
@@ -75,8 +78,8 @@ pub struct DynamicClustering<const ARITY: usize, V> {
     pub sampling_seeds: usize,
 
     pub num_clusters: usize,
-    pub cluster_alg:
-        Arc<dyn Fn(&mut SparseRowMat<usize, f64>, usize) -> Vec<usize> + Send + Sync + 'static>,
+    pub cluster_alg: AlgType,
+    pub prop_name: String,
 }
 
 impl<const ARITY: usize, V: std::hash::Hash + Eq + Clone + Copy> DynamicClustering<ARITY, V> {
@@ -85,7 +88,8 @@ impl<const ARITY: usize, V: std::hash::Hash + Eq + Clone + Copy> DynamicClusteri
         coreset_size: usize,
         sampling_seeds: usize,
         num_clusters: usize,
-        cluster_alg: fn(&mut SparseRowMat<usize, f64>, usize) -> Vec<usize>,
+        cluster_alg: AlgType,
+        prop_name: String,
     ) -> Self {
         Self {
             node_to_tree_map: Default::default(),
@@ -98,7 +102,8 @@ impl<const ARITY: usize, V: std::hash::Hash + Eq + Clone + Copy> DynamicClusteri
             coreset_size,
             sampling_seeds,
             num_clusters,
-            cluster_alg: Arc::new(cluster_alg),
+            cluster_alg,
+            prop_name
         }
     }
 }
@@ -159,7 +164,9 @@ impl<const ARITY: usize, V: std::hash::Hash + Eq + Clone + Copy + Send + Sync>
         // println!("{}", coreset.nodes.len());
         let mut coreset_graph = self.build_coreset_graph(&coreset, time, graph);
 
-        let coreset_labels = (self.cluster_alg)(&mut coreset_graph, self.num_clusters);
+        let (coreset_labels,k) = (self.cluster_alg)(&mut coreset_graph, self.num_clusters);
+        // for algorithms that determine k themselves:
+        self.num_clusters = k;
 
         coreset.coreset_labels = Some(coreset_labels.clone());
 
@@ -174,17 +181,17 @@ impl<const ARITY: usize, V: std::hash::Hash + Eq + Clone + Copy + Send + Sync>
         match part_type {
             PartitionType::All => {
                 let result = names.into_iter().zip(labels).collect();
-                PartitionOutput::All(result)
+                PartitionOutput::All(result, self.num_clusters)
             }
-            PartitionType::Subset(_) => PartitionOutput::Subset(labels),
+            PartitionType::Subset(_) => PartitionOutput::Subset(labels, self.num_clusters),
         }
     }
 }
 
-pub fn cluster(graph: &mut SparseRowMat<usize, f64>, k: usize) -> Vec<usize> {
+pub fn cluster(graph: &mut SparseRowMat<usize, f64>, k: usize) -> (Vec<usize>, usize) {
     let n = graph.ncols();
     if n == 0 || k == 0 {
-        return Vec::new();
+        return (Vec::new(), 0);
     }
 
     // Build M = I - 0.5 * (normalized Laplacian) directly from the adjacency and
@@ -234,7 +241,7 @@ pub fn cluster(graph: &mut SparseRowMat<usize, f64>, k: usize) -> Vec<usize> {
         });
     }
 
-    kmeans_labels(&eigvecs, k)
+    (kmeans_labels(&eigvecs, k), k)
 }
 
 /// Build M = I - 0.5 * (normalized Laplacian) in-place on `mat`,

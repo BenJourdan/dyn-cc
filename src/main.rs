@@ -7,6 +7,7 @@ use crate::snapshot_clustering::DiffGraph;
 use raphtory::db::graph::views::deletion_graph::PersistentGraph;
 use raphtory::{core::entities::VID, prelude::*};
 use core::num;
+use std::sync::Arc;
 use rand::{SeedableRng, rngs::StdRng};
 use rand::seq::SliceRandom;
 use std::time::Instant;
@@ -71,7 +72,8 @@ fn main() {
         coreset_size,
         sampling_seeds,
         num_clusters,
-        alg::cluster,
+        Arc::new(alg::cluster),
+        String::from("w")
     );
 
     let t2 = Instant::now();
@@ -84,8 +86,8 @@ fn main() {
         partitions
             .iter()
             .map(|(_t, part)| match part {
-                crate::snapshot_clustering::PartitionOutput::All(_) => unreachable!(),
-                crate::snapshot_clustering::PartitionOutput::Subset(predicted_labels) => {
+                crate::snapshot_clustering::PartitionOutput::All(_, _) => unreachable!(),
+                crate::snapshot_clustering::PartitionOutput::Subset(predicted_labels, _) => {
                     assert!(subset_labels.len() == predicted_labels.len());
                     adjusted_rand_index(
                         subset_labels.as_slice(),
